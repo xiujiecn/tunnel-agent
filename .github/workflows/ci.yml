@@ -30,28 +30,29 @@ jobs:
           go-version: '1.24'
           cache: true
 
-      # ★ gofmt 与 vet 是"能不能被合并"的前置条件，不是建议。
+      # ★ gofmt 与 vet 是「能不能被合并」的前置条件，不是建议。
       #
-      #   ★★ 刻意用 `shell: bash` 而不是默认 shell：
-      #   Windows runner 的默认是 PowerShell，而 `out=$(gofmt -l .)` +
-      #   `if [ -n "$out" ]` 是POSIX 语法 —— 在 PowerShell 下直接报语法错，
-      #   于是 job 挂在**格式检查**上，而与代码是否真的格式化过无关。
-      #   （真实踩过：首次 push 的 run 里 ubuntu/macos 都过，只有 Windows 红了。）
-      #   ⇒ 这类"用shell 语法写逻辑"的步骤必须显式声明 shell，
-      #     或者干脆不要 shell。
-      - name: gofmt
+      # ★★ 刻意**不写任何 shell 逻辑**（第一版写了 `out=$(gofmt -l .)` +
+      #   `if [ -n "$out" ]` + `shell: bash`，在 Windows 上仍然红）。
+      #
+      #   两次失败各暴露一个跨平台陷阱：
+      #     ① Windows runner 默认 shell 是 **PowerShell**，POSIX 语法直接报错；
+      #        加 `shell: bash` 之后能跑，但——
+      #     ② `set -euo pipefail` + 中文 `::error::` 输出在 Git Bash 的
+      #        代码页下会出问题（Windows 默认 GBK，中文与 `::` 标记易被截断/乱码，
+      #        而 Actions 对乱码输出的解析并不宽容）。
+      #
+      #   ⇒ 解法：**把判断交给一个仓库脚本**，yml 里只调它。
+      #     `gofmt -d .` 单独用**不行** —— 它只打印 diff、退出码恒为 0，
+      #     有未格式化文件时 step照样绿（这个坑我自己踩过一次）。
+      #     所以判断逻辑放在 scripts/check-fmt.sh 里：
+      #     既能本地实跑验证，又是纯 bash 3 可写、不依赖 runner 默认 shell。
+      #
+      #   ★ 教训：**CI 里跨平台的 step，越少逻辑越好**——
+      #     逻辑该写在仓库脚本里（可本地验证），而不是散在 yml 里。
+      - name: 格式检查
         shell: bash
-        run: |
-          set -euo pipefail
-          out=$(gofmt -l .)
-          if [ -n "$out" ]; then
-            echo "::error::这些文件未格式化："
-            echo "$out"
-            echo "--- diff ---"
-            gofmt -d .
-            exit 1
-          fi
-          echo "gofmt 干净"
+        run: bash scripts/check-fmt.sh
 
       - name: go vet
         run: go vet ./...
