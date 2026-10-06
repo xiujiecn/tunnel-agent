@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 构建与测试
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # agent 跑在用户自己的机器上，跨平台都要能编出来
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      # ★ gofmt 与 vet 是"能不能被合并"的前置条件，不是建议。
+      #   单文件 Go 程序里格式问题只有一处，但那一处就会被 review 挑出来。
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "这些文件未格式化："
+            echo "$out"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1 -race
+
+      - name: 构建
+        run: go build -o tunnel-agent .
+
+  cross-compile:
+    name: 交叉编译（${{ matrix.target }}）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      # ★ 这一条是本仓库最实际的门禁：用户是把二进制**下载到别的机器上**跑的，
+      #   所以"在 Ubuntu 上编出来的能不能在 Windows 上跑"是核心问题，
+      #   而不是"能不能在本机跑起来"。
+      - name: 交叉编译
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in \
+            darwin/arm64 darwin/amd64 \
+            linux/amd64 linux/arm64 \
+            windows/amd64 windows/arm64
+          do
+            os="${target%%/*}"
+            arch="${target##*/}"
+            out="dist/tunnel-agent-${os}-${arch}"
+            [ "$os" = "windows" ] && out="${out}.exe"
+            echo "▶ $os/$arch"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$out" .
+            ls -lh "$out"
+          done
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-agent-binaries
+          path: dist/
+          retention-days: 30

@@ -1,0 +1,14 @@
+# 编译产物
+/tunnel-agent
+/tunnel-agent-*
+*.exe
+
+# 测试与覆盖率
+*.test
+*.out
+coverage.*
+
+# 编辑器
+.DS_Store
+.idea/
+.vscode/
