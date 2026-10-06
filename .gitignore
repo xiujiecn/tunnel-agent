@@ -1,7 +1,10 @@
 # 编译产物
+# ★ 根目录与 dist/ 都要写：`/tunnel-agent` 只管根目录，
+#   而交叉编译的输出在 dist/ 下 —— 漏了它，git status 里会出现六个二进制。
 /tunnel-agent
 /tunnel-agent-*
 *.exe
+/dist/
 
 # 测试与覆盖率
 *.test
