@@ -31,16 +31,27 @@ jobs:
           cache: true
 
       # ★ gofmt 与 vet 是"能不能被合并"的前置条件，不是建议。
-      #   单文件 Go 程序里格式问题只有一处，但那一处就会被 review 挑出来。
+      #
+      #   ★★ 刻意用 `shell: bash` 而不是默认 shell：
+      #   Windows runner 的默认是 PowerShell，而 `out=$(gofmt -l .)` +
+      #   `if [ -n "$out" ]` 是POSIX 语法 —— 在 PowerShell 下直接报语法错，
+      #   于是 job 挂在**格式检查**上，而与代码是否真的格式化过无关。
+      #   （真实踩过：首次 push 的 run 里 ubuntu/macos 都过，只有 Windows 红了。）
+      #   ⇒ 这类"用shell 语法写逻辑"的步骤必须显式声明 shell，
+      #     或者干脆不要 shell。
       - name: gofmt
+        shell: bash
         run: |
+          set -euo pipefail
           out=$(gofmt -l .)
           if [ -n "$out" ]; then
-            echo "这些文件未格式化："
+            echo "::error::这些文件未格式化："
             echo "$out"
+            echo "--- diff ---"
             gofmt -d .
             exit 1
           fi
+          echo "gofmt 干净"
 
       - name: go vet
         run: go vet ./...
@@ -66,6 +77,9 @@ jobs:
       #   所以"在 Ubuntu 上编出来的能不能在 Windows 上跑"是核心问题，
       #   而不是"能不能在本机跑起来"。
       - name: 交叉编译
+        # ★ 这个 job 只在 ubuntu 上跑，但显式声明 bash 仍然是好习惯：
+        #   将来有人把它加进三平台矩阵时不会突然踩 PowerShell 的坑。
+        shell: bash
         env:
           CGO_ENABLED: '0'
         run: |
@@ -84,6 +98,11 @@ jobs:
             GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$out" .
             ls -lh "$out"
           done
+
+      # ★ 与 release.yml 共用同一个校验脚本（不内联第二份）——
+      #   CI 先拦住问题，就不必等发布流程才发现。
+      - name: 校验产物架构
+        run: bash scripts/verify-artifacts.sh
 
       - name: 上传产物
         uses: actions/upload-artifact@v4

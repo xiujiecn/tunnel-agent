@@ -1,0 +1,210 @@
+name: release
+
+# 在打 tag 时发布六平台二进制。
+#
+# ★ 为什么用 tag 触发而不是手动 dispatch：
+#   tag 本身就是版本号（v0.1.0），产物与 tag 一一对应，
+#   而"手动触发再填一个版本号"迟早会出现 tag 与版本号对不上的情况。
+on:
+  push:
+    tags: ['v*']
+  # 允许手动触发（改完 CI 想先出一份预发布产物时用）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（如 v0.1.0）。留空则用当前短 SHA'
+        required: false
+        type: string
+
+permissions:
+  contents: write   # ★ 创建 Release 需要，比默认的 read 高
+
+jobs:
+  build:
+    name: 构建六平台产物
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: 定版本
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            [ -n "$TAG" ] || TAG="$(git rev-parse --short HEAD)"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::版本号解析为空，拒绝发布一个没有版本号的 Release"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "将发布：$TAG"
+
+      # ★ 发布物必须与 tag 严格对应。
+      #   tag 触发时若 working tree 脏了，说明 checkout 出来的东西不是那个 tag 的内容 ——
+      #   这时产物文件名对得上，内容却不是该版本的，是最坏的一种错。
+      - name: 校验工作区与 tag 一致
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::工作区不干净，构建产物可能不对应该 tag"
+            git status --porcelain
+            exit 1
+          fi
+
+      - name: 单元测试
+        run: go test ./... -count=1
+
+      - name: 交叉编译
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in \
+            darwin/arm64 darwin/amd64 \
+            linux/amd64 linux/arm64 \
+            windows/amd64 windows/arm64
+          do
+            os="${target%%/*}"
+            arch="${target##*/}"
+            out="dist/tunnel-agent-${os}-${arch}"
+            [ "$os" = "windows" ] && out="${out}.exe"
+            echo "▶ $os/$arch"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$out" .
+            ls -lh "$out"
+          done
+
+      # ★ 校验每个产物都是预期的平台 —— 交叉编译最容易出的错是
+      #   "环境变量没生效，于是六个文件其实是同一种架构"。
+      #   这在 CI 上肉眼看不出来（都构建成功），只有真机跑才会炸。
+      #
+      # ★ 复用 scripts/verify-artifacts.sh 而不是在这里内联一份：
+      #   两份同样的校验逻辑必然漂移（改了一处忘了另一处）——
+      #   而"漂移后的校验"是比没有校验更坏的东西。
+      #   ★ 该脚本刻意**不用关联数组**（declare -A）：runner 默认 shell 是
+      #     `bash -e`，关联数组需要 bash 4+，macOS 自带的 3.2 也没有。
+      - name: 校验产物架构
+        run: bash scripts/verify-artifacts.sh
+
+      - name: 生成校验和
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-agent-binaries
+          path: dist/
+          retention-days: 90
+
+  release:
+    name: 创建 Release
+    needs: build          # ★ 等构建成功才发 —— 没产物就不该有 Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载产物
+        uses: actions/download-artifact@v4
+        with:
+          name: tunnel-agent-binaries
+          path: dist
+
+      # ★★★ 必须重建 tag，不能写 ${{ steps.ver.outputs.tag }}。
+      #
+      #   `steps.*.outputs` 是**job 内**作用域 —— 它在 build job 里，
+      #   在这个 release job 里引用会解析成空字符串，
+      #   于是 Release 名字变成 "tunnel-agent "、body 里 $TAG 为空，
+      #   **而 workflow 仍然显示成功**（发布出来的东西却不对）。
+      #
+      #   ⇒ 从事件上下文重新推导：push 到 tag 时 GITHUB_REF 就是 tag；
+      #     手动触发时用 workflow 输入。两条路径都覆盖到了。
+      - name: 定版本（与 build job 同规则）
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            [ -n "$TAG" ] || TAG="$(git rev-parse --short HEAD)"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: 生成发布说明
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          cat > notes.md <<EOF
+          ## tunnel-agent $TAG
+
+          内网穿透客户端 —— 把本机的一个 HTTP 服务暴露成公网可访问的地址。
+
+          ### 下载
+
+          | 平台 | 文件 |
+          |---|---|
+          | macOS (Apple 芯片) | \`tunnel-agent-darwin-arm64\` |
+          | macOS (Intel) | \`tunnel-agent-darwin-amd64\` |
+          | Linux (x86_64) | \`tunnel-agent-linux-amd64\` |
+          | Linux (ARM64) | \`tunnel-agent-linux-arm64\` |
+          | Windows (x64) | \`tunnel-agent-windows-amd64.exe\` |
+          | Windows (ARM64) | \`tunnel-agent-windows-arm64.exe\` |
+
+          全部静态链接（\`CGO_ENABLED=0\`），下载后先加执行权限：
+
+          \`\`\`bash
+          chmod +x tunnel-agent-*
+          \`\`\`
+
+          校验和见 \`SHA256SUMS.txt\`。
+
+          ### 用法
+
+          \`\`\`bash
+          tunnel-agent \\
+            -server wss://<你的服务端>/api/v1/tunnel/agent/attach \\
+            -token  <绑定票据> \\
+            -local  127.0.0.1:3000
+          \`\`\`
+
+          ⚠️ **这会把你的本地服务暴露到公网。** 只把地址分享给确实需要访问的人。
+          关掉进程地址即失效。
+
+          **本仓库只含客户端** —— 签发票据、隧道分发与入站代理需要自建服务端，
+          详见 README 的「与本仓库无关的部分」。
+
+          安装方式也可以直接用 Go：
+
+          \`\`\`bash
+          go install github.com/xiujiecn/tunnel-agent@$TAG
+          \`\`\`
+
+          ---
+          校验方式：\`sha256sum -c SHA256SUMS.txt\`
+          EOF
+          echo "发布说明已生成（$(wc -l < notes.md) 行）"
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: tunnel-agent ${{ steps.ver.outputs.tag }}
+          body_path: notes.md
+          files: |
+            dist/tunnel-agent-*
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ !startsWith(steps.ver.outputs.tag, 'v') }}

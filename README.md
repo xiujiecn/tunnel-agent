@@ -39,15 +39,30 @@ cd tunnel-agent
 go build -o tunnel-agent .
 ```
 
-跨平台编译：
+### 直接下载
+
+[Releases](https://github.com/xiujiecn/tunnel-agent/releases) 页面提供六个平台的预编译产物
+（macOS / Linux / Windows × 各自常见架构），全部静态链接，下载后 `chmod +x` 即可运行，
+并附 `SHA256SUMS.txt`。
+
+也可以自己交叉编译：
 
 ```bash
-GOOS=darwin  GOARCH=arm64 go build -o tunnel-agent-darwin-arm64 .
-GOOS=windows GOARCH=amd64  go build -o tunnel-agent-windows-amd64.exe .
-GOOS=linux   GOARCH=amd64  go build -o tunnel-agent-linux-amd64 .
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o tunnel-agent-darwin-arm64 .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64  go build -o tunnel-agent-windows-amd64.exe .
+CGO_ENABLED=0 GOOS=linux   GOARCH=amd64  go build -o tunnel-agent-linux-amd64 .
 ```
 
-客户端是静态链接的（`CGO_ENABLED=0`），拷到目标机器即可运行。
+### 校验产物架构
+
+交叉编译最常见的错误是「环境变量没生效，于是六个文件其实是同一种架构」——
+它在 CI 上看起来完全正常（都构建成功），只有下载后在错误的机器上跑才会炸。
+
+```bash
+bash scripts/verify-artifacts.sh   # 逐个核对 dist/ 里产物的真实架构
+```
+
+这条检查也在 CI 与发布流程里各跑一次。
 
 ---
 
@@ -157,7 +172,12 @@ go build ./...      # 构建
 go test ./...       # 测试（4 条，含两条静态结构守卫）
 go vet ./...        # 静态检查
 gofmt -l .          # 格式检查，应无输出
+
+bash scripts/verify-artifacts.sh   # 校验交叉编译产物的架构（先go build 出 dist/）
 ```
+
+发布：`git tag v0.1.0 && git push --tags` —— tag 会触发
+[release.yml](.github/workflows/release.yml) 构建六个平台并创建 Release。
 
 测试里有两条**扫源码**的守卫（断言"登记发生在 `go` 语句之前"这类结构事实），
 因为那类竞态在行为层面很难稳定复现，而"写法本身就是错的"可以直接断言。
