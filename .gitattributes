@@ -1,0 +1,28 @@
+# ★ 换行符策略：不加这个文件，Windows 上的 gofmt 会一直报"未格式化"。
+#
+#   机制：Windows 的 Git 默认 core.autocrlf=true，checkout 时会把 LF 转成 CRLF；
+#   而 gofmt 只接受 LF —— 于是同一份代码在 ubuntu/macos 上干净、
+#   在 windows 上被判为"未格式化"，且怎么改代码都没用。
+#
+#   ★ 症状极隐蔽：它看起来像"代码格式有问题"，实际是换行符问题，
+#     于是人会去反复 gofmt -w，而那个改动在 Windows 上做完还是红。
+#
+#   语义：
+#     text=auto        —— 让 Git 自行判断文本/二进制
+#     *.go   text eol=lf—— Go 源码强制 LF（gofmt 的硬要求）
+#     *.sh   text eol=lf—— shell 脚本必须 LF，否则在 Linux 上跑不起来
+#     *.yml  text eol=lf—— CI 配置同理（YAML 对 CRLF 也不友好）
+#     *.md   text eol=lf—— 避免 diff 里出现 ^M
+*.go   text eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+
+# 二进制不做任何转换
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.exe  binary
