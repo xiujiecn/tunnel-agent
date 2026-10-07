@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>tunnel-agent 控制台</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; font-size: 14px; color: #16181d; background: #f5f6f8; }
+    body { max-width: 960px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 1.25rem; margin: 0 0 8px; }
+    .hint { color: #4a5160; margin-bottom: 16px; }
+    label { display: block; font-weight: 600; margin-top: 12px; }
+    input, textarea { width: 100%; box-sizing: border-box; padding: 8px; margin-top: 4px; font-family: ui-monospace, monospace; }
+    textarea { min-height: 72px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+    button { padding: 8px 16px; cursor: pointer; }
+    button.primary { background: #0b5bd3; color: #fff; border: none; border-radius: 4px; }
+    button.danger { background: #c0261a; color: #fff; border: none; border-radius: 4px; }
+    #log { background: #16181d; color: #e8eaed; padding: 12px; height: 280px; overflow: auto; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; margin-top: 8px; border-radius: 4px; }
+    .status { margin-top: 8px; font-weight: 600; }
+    .status.on { color: #15803d; }
+    .status.off { color: #616875; }
+  </style>
+</head>
+<body>
+  <h1>tunnel-agent 控制台</h1>
+  <p class="hint">从秀杰工作台「内网穿透」复制启动命令，粘贴到下方或填写各参数后点「运行」。关闭本页<strong>不会</strong>退出程序，请从系统托盘选择「退出」。</p>
+
+  <label for="paste">粘贴整行命令</label>
+  <textarea id="paste" placeholder="tunnel-agent -server wss://… -token … -local 127.0.0.1:3000"></textarea>
+
+  <label for="server">-server</label>
+  <input id="server" type="text" autocomplete="off" />
+
+  <label for="token">-token</label>
+  <input id="token" type="text" autocomplete="off" />
+
+  <label for="local">-local</label>
+  <input id="local" type="text" value="127.0.0.1:3000" autocomplete="off" />
+
+  <label><input type="checkbox" id="verbose" /> 详细日志（-v）</label>
+
+  <div class="row">
+    <button type="button" class="primary" id="run">运行</button>
+    <button type="button" class="danger" id="stop">停止</button>
+    <button type="button" id="parse">从粘贴解析到表单</button>
+  </div>
+
+  <p class="status off" id="status">状态：未运行</p>
+
+  <label>运行日志</label>
+  <div class="row">
+    <button type="button" id="copyLog">复制日志</button>
+    <button type="button" id="clearLog">清空</button>
+  </div>
+  <div id="log" aria-live="polite"></div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    const statusEl = document.getElementById('status');
+
+    function appendLog(line) {
+      logEl.textContent += (logEl.textContent ? '\n' : '') + line;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function refreshStatus() {
+      const r = await fetch('/api/status');
+      const j = await r.json();
+      const on = j.running;
+      statusEl.textContent = on ? '状态：运行中' : '状态：未运行' + (j.error ? '（' + j.error + '）' : '');
+      statusEl.className = 'status ' + (on ? 'on' : 'off');
+    }
+
+    const es = new EventSource('/api/logs');
+    es.onmessage = (ev) => appendLog(ev.data);
+    es.onerror = () => { /* 浏览器会自动重连 */ };
+
+    document.getElementById('run').onclick = async () => {
+      const body = {
+        server: document.getElementById('server').value,
+        token: document.getElementById('token').value,
+        local: document.getElementById('local').value,
+        verbose: document.getElementById('verbose').checked,
+        paste: document.getElementById('paste').value.trim() ? document.getElementById('paste').value : ''
+      };
+      const r = await fetch('/api/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const j = await r.json();
+      if (!j.ok) alert(j.error || '启动失败');
+      await refreshStatus();
+    };
+
+    document.getElementById('stop').onclick = async () => {
+      await fetch('/api/stop', { method: 'POST' });
+      await refreshStatus();
+    };
+
+    document.getElementById('parse').onclick = async () => {
+      const paste = document.getElementById('paste').value.trim();
+      if (!paste) return;
+      const r = await fetch('/api/parse', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paste }) });
+      const j = await r.json();
+      if (!j.ok) { alert(j.error || '解析失败'); return; }
+      document.getElementById('server').value = j.server || '';
+      document.getElementById('token').value = j.token || '';
+      document.getElementById('local').value = j.local || '127.0.0.1:3000';
+      document.getElementById('verbose').checked = !!j.verbose;
+    };
+
+    document.getElementById('copyLog').onclick = async () => {
+      const r = await fetch('/api/logs/snapshot');
+      const j = await r.json();
+      await navigator.clipboard.writeText(j.text || '');
+    };
+
+    document.getElementById('clearLog').onclick = async () => {
+      await fetch('/api/logs/clear', { method: 'POST' });
+      logEl.textContent = '';
+    };
+
+    refreshStatus();
+    setInterval(refreshStatus, 2000);
+  </script>
+</body>
+</html>
