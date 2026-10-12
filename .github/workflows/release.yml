@@ -111,13 +111,6 @@ jobs:
       - name: 校验产物架构
         run: bash scripts/verify-artifacts.sh dist unix
 
-      - name: 生成校验和
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
@@ -192,6 +185,26 @@ jobs:
       #
       #   ⇒ 从事件上下文重新推导：push 到 tag 时 GITHUB_REF 就是 tag；
       #     手动触发时用 workflow 输入。两条路径都覆盖到了。
+      # ★ 校验和必须在【两个 artifact 都下载完】之后生成。
+      #   原先在 build job 里 `sha256sum *`，而那个 job 只有 linux/windows 产物 ——
+      #   macOS 的两个 .tar.gz 由 build-macos job 产出 ⇒ 发布出去的
+      #   SHA256SUMS.txt 里【根本没有 macOS 条目】，用户无法校验 mac 下载包
+      #   （实测：release 的 SHA256SUMS.txt 只有 4 行）。这里重算成完整的。
+      - name: 生成校验和（汇总全部产物）
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum tunnel-agent-* > SHA256SUMS.txt
+          echo "── SHA256SUMS.txt ──"
+          cat SHA256SUMS.txt
+          echo
+          # ★ 断言：六个平台一个不少 —— 少一个就说明某个 artifact 没下全
+          n=$(wc -l < SHA256SUMS.txt)
+          if [ "$n" -ne 6 ]; then
+            echo "::error::SHA256SUMS.txt 应有 6 行（六个平台），实际 $n 行"
+            exit 1
+          fi
+
       - name: 定版本（与 build job 同规则）
         id: ver
         run: |
