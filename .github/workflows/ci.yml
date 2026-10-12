@@ -64,7 +64,7 @@ jobs:
         run: go build -o tunnel-agent .
 
   cross-compile:
-    name: 交叉编译（${{ matrix.target }}）
+    name: 交叉编译 linux/windows
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,9 +86,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          for target in \
-            darwin/arm64 darwin/amd64 \
-            linux/amd64 linux/arm64 \
+          # ★ macOS 已从这里移除：状态栏托盘是 cgo（Cocoa），
+          #   CGO_ENABLED=0 时 darwin 的 gui 包缺 runTray/runHostWindow，
+          #   构建会报 undefined —— 见下方 macos-app job。
+          for target in \\
+            linux/amd64 linux/arm64 \\
             windows/amd64 windows/arm64
           do
             os="${target%%/*}"
@@ -110,4 +112,45 @@ jobs:
         with:
           name: tunnel-agent-binaries
           path: dist/
+          retention-days: 30
+
+  # ★ macOS 单独一个 job：托盘走 cgo（Cocoa），必须在真 mac 机器上编，
+  #   且 CGO_ENABLED=1 —— 所以它不能挤进上面 ubuntu 的交叉编译循环。
+  macos-app:
+    name: 构建 macOS 产物（cgo）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: 构建 macOS .app + 裸二进制
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in arm64 amd64; do
+            echo "▶ darwin/$arch"
+            bash scripts/build-macos.sh "$arch" dist
+          done
+          ls -laR dist/
+
+      - name: 校验产物齐全
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          for a in arm64 amd64; do
+            test -f "dist/tunnel-agent-darwin-${a}" || { echo "::error::缺裸二进制 ${a}"; exit 1; }
+            test -f "dist/tunnel-agent-darwin-${a}.app.zip" || { echo "::error::缺 .app.zip ${a}"; exit 1; }
+          done
+          echo "✓ macOS 产物齐全"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-agent-macos
+          path: dist/*
           retention-days: 30

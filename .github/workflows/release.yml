@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   build:
-    name: 构建六平台产物
+    name: 构建 linux/windows 产物
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,9 +70,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          for target in \
-            darwin/arm64 darwin/amd64 \
-            linux/amd64 linux/arm64 \
+          # ★ macOS 已从这里移除：托盘走 cgo（Cocoa），必须在 mac runner 上编，
+          #   见下方 build-macos job。CGO_ENABLED=0 编 darwin 会报 undefined。
+          for target in \\
+            linux/amd64 linux/arm64 \\
             windows/amd64 windows/arm64
           do
             os="${target%%/*}"
@@ -110,16 +111,63 @@ jobs:
           path: dist/
           retention-days: 90
 
+  # ★ macOS 必须单独一个 job：状态栏托盘是 cgo（Cocoa），
+  #   只能在真 mac 机器上编，且 CGO_ENABLED=1。
+  build-macos:
+    name: 构建 macOS 产物（cgo）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: 单元测试
+        run: go test ./... -count=1
+
+      - name: 构建 .app + 裸二进制（两个架构）
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in arm64 amd64; do
+            echo "▶ darwin/$arch"
+            bash scripts/build-macos.sh "$arch" dist
+          done
+          ls -laR dist/
+
+      - name: 校验产物架构
+        shell: bash
+        run: bash scripts/verify-artifacts.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-agent-macos
+          path: dist/
+          retention-days: 90
+
+
   release:
     name: 创建 Release
-    needs: build          # ★ 等构建成功才发 —— 没产物就不该有 Release
+    needs: [build, build-macos]   # ★ 两个构建都成功才发——没产物就不该有 Release
     runs-on: ubuntu-latest
     steps:
-      - name: 下载产物
+      - name: 下载产物（linux/windows）
         uses: actions/download-artifact@v4
         with:
           name: tunnel-agent-binaries
           path: dist
+
+      # ★ 两份 artifact 合并进 dist/：release 里 files: dist/tunnel-agent-* 一把抓
+      - name: 下载产物（macOS）
+        uses: actions/download-artifact@v4
+        with:
+          name: tunnel-agent-macos
+          path: dist
+          merge-multiple: true
 
       # ★★★ 必须重建 tag，不能写 ${{ steps.ver.outputs.tag }}。
       #
