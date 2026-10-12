@@ -77,13 +77,26 @@ jobs:
       - name: go test
         shell: bash
         run: |
-          set -euo pipefail
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            echo "macOS：跳过 -race，改用普通测试"
-            go test ./... -count=1
-          else
-            go test ./... -count=1 -race
+          set -uo pipefail
+          FLAGS="-count=1 -v -timeout=120s"
+          [ "${{ runner.os }}" = "macOS" ] || FLAGS="$FLAGS -race"
+          # ★ 逐包跑：任何一个包挂掉时，能立刻看出是哪一个，
+          #   而不是只得到一句 "FAIL github.com/... [build failed]"。
+          FAILED=0
+          for pkg in . ./agent ./gui ./lib; do
+            echo "════════ go test $pkg ════════"
+            if ! go test $FLAGS "$pkg" 2>&1; then
+              echo "::error::包 $pkg 测试失败（上面是该包完整输出）"
+              FAILED=1
+            fi
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo "---- 失败时 dump 环境，便于定位 ----"
+            go version; go env GOOS GOARCH CGO_ENABLED
+            uname -a
+            exit 1
           fi
+          echo "全部包测试通过"
 
       - name: 构建
         run: go build -o tunnel-agent .
