@@ -37,15 +37,16 @@ import (
 )
 
 // ★ 状态栏 Template 图标（18pt）。放在 gui/assets/ 下。
-//   go:embed 在文件缺失时直接编译失败 ⇒ 需确保 assets/trayTemplate.png 存在。
+//
+//	go:embed 在文件缺失时直接编译失败 ⇒ 需确保 assets/trayTemplate.png 存在。
 //
 //go:embed assets/trayTemplate.png
 var trayIconPNG []byte
 
 // ★ 本文件自己持有托盘回调。
 //
-//   注意：`host` / `hostURL` 这两个包级变量定义在 tray_windows.go（build tag: windows），
-//   在 darwin 上并不存在 —— 所以这里不能用它们，否则非 Windows 平台编译失败。
+//	注意：`host` / `hostURL` 这两个包级变量定义在 tray_windows.go（build tag: windows），
+//	在 darwin 上并不存在 —— 所以这里不能用它们，否则非 Windows 平台编译失败。
 var (
 	darwinHost    TrayHost
 	darwinHostURL string
@@ -80,8 +81,9 @@ func goTrayReady() {
 // runTray 接管当前线程跑 Cocoa 事件循环。
 //
 // ★ 必须在【主线程】调用 —— 见 run.go 里对 darwin 的分支：
-//   macOS 要求所有 AppKit 操作在主线程，放到 goroutine 里会静默失败
-//   （表现就是"启动后看不到托盘图标"，且没有任何报错）。
+//
+//	macOS 要求所有 AppKit 操作在主线程，放到 goroutine 里会静默失败
+//	（表现就是"启动后看不到托盘图标"，且没有任何报错）。
 func runTray(h TrayHost) {
 	darwinHost = h
 	runtime.LockOSThread()
