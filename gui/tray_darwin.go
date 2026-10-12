@@ -21,6 +21,12 @@ package gui
 /*
 #cgo LDFLAGS: -framework Cocoa
 
+// ★ 必须有：C.CString / C.free 由 stdlib.h 提供。
+//   把 ObjC 代码搬到 .m 之后，preamble 里只剩 extern 声明，
+//   少了这个 include 就会报：
+//     could not determine what C.free refers to
+#include <stdlib.h>
+
 // ── 以下实现全部在 tray_darwin.m ──
 extern void xjTrayInstall(const char *tooltip,
                           const unsigned char *pngBytes, int pngLen, double ptSize);
@@ -89,6 +95,8 @@ func runTray(h TrayHost) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	// ★ tip 用 defer free；xjTrayInstall 内部会【复制】字符串，
+	//   所以返回后释放是安全的（不会悬垂）。
 	tip := C.CString("tunnel-agent")
 	defer C.free(unsafe.Pointer(tip))
 
