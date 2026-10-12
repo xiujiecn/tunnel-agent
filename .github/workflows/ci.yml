@@ -57,8 +57,33 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # ★ 诊断：macOS 的 cgo 报错常常只有一行 "exit status 1"，看不出原因。
+      #   把编译器版本、关键 go env、以及单独编 gui 包的结果都打出来。
+      - name: 诊断（编译器与 cgo）
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "== runner =="; uname -a
+          echo "== go =="; go version; go env GOOS GOARCH CGO_ENABLED CC CXX
+          echo "== cc =="; (cc --version 2>&1 | head -3) || echo "cc 缺失"
+          echo "== clang =="; (clang --version 2>&1 | head -3) || echo "clang 缺失"
+          echo "== 单独编译 gui 包（cgo 隔离验证）=="
+          CGO_ENABLED=1 go build -x ./gui/ 2>&1 | tail -40 || echo "gui 包编译失败（见上）"
+
+      # ★ 竞态检测只在非 macOS 上跑：
+      #   gui 包在 darwin 下是 cgo（ObjC/Cocoa），而 -race 要注入自己的运行时，
+      #   两者在 mac 上组合容易在链接阶段失败；同一份代码已在 ubuntu 用 -race 覆盖，
+      #   mac 上再跑一次收益很低，却会掩盖真正的错误信息。
       - name: go test
-        run: go test ./... -count=1 -race
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            echo "macOS：跳过 -race，改用普通测试"
+            go test ./... -count=1
+          else
+            go test ./... -count=1 -race
+          fi
 
       - name: 构建
         run: go build -o tunnel-agent .
@@ -126,6 +151,16 @@ jobs:
         with:
           go-version-file: go.mod   # ★ 跟随 go.mod，避免版本漂移
           cache: true
+
+      - name: 诊断（macOS 工具链）
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "== runner =="; uname -a
+          echo "== go =="; go version; go env GOOS GOARCH CGO_ENABLED CC
+          echo "== xcode =="; xcode-select -p || true
+          echo "== 单独编译 gui 包（cgo 隔离验证）=="
+          CGO_ENABLED=1 go build -v ./gui/ 2>&1 | tail -50 || echo "gui 编译失败（见上）"
 
       - name: 构建 macOS .app + 裸二进制
         shell: bash
