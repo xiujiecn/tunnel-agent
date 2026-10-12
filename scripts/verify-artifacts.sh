@@ -47,8 +47,22 @@ check() {  # check <文件名> <期望架构正则>
         fail=1
         return
       fi
-      # macOS 归档内是 .app，二进制在 Contents/MacOS 下；Linux 归档内就是二进制
-      inner="$(find "$WORK" -type f -name 'tunnel-agent*' | head -1)"
+      # ★ 用【精确路径】而不是 find：
+      #   macOS 的 .app 里除主程序外还有 assets/tunnel-agent.ico，
+      #   用 `find -name 'tunnel-agent*' | head -1` 会先命中那个 .ico
+      #   ⇒ 误报「没有可执行位」「不是 Mach-O」（实测踩过）。
+      case "$1" in
+        tunnel-agent-darwin-*)
+          inner="$WORK/tunnel-agent.app/Contents/MacOS/tunnel-agent"
+          INNER_NAME="tunnel-agent.app/Contents/MacOS/tunnel-agent"
+          ;;
+        tunnel-agent-linux-*)
+          inner="$WORK/tunnel-agent"
+          INNER_NAME="tunnel-agent"
+          ;;
+        *) echo "::error::$1 不是已知的 tar.gz 产物名"; fail=1; return ;;
+      esac
+      ARCHIVE_KIND="tar"
       ;;
     *.zip)
       if ! unzip -qo "$f" -d "$WORK" 2>/dev/null; then
@@ -56,7 +70,8 @@ check() {  # check <文件名> <期望架构正则>
         fail=1
         return
       fi
-      inner="$(find "$WORK" -type f -name '*.exe' | head -1)"
+      inner="$WORK/tunnel-agent.exe"
+      ARCHIVE_KIND="zip"
       ;;
     *)
       echo "::error::$1 不是预期的归档类型"
@@ -65,17 +80,52 @@ check() {  # check <文件名> <期望架构正则>
       ;;
   esac
 
-  if [ -z "$inner" ]; then
-    echo "::error::$1 里找不到可执行文件"
+  if [ ! -f "$inner" ]; then
+    echo "::error::$1 里找不到预期的可执行文件（$(basename "$inner")）"
     fail=1
     return
   fi
 
-  # ★ .app / 二进制里的可执行位必须还在：丢了的话 macOS 双击毫无反应，
-  #   而现象和「程序有 bug」一模一样，极难定位。
-  if [ ! -x "$inner" ]; then
-    echo "::error::$1 解出的 $(basename "$inner") 没有可执行位（打包时未保留 mode？）"
-    fail=1
+  # ★ macOS：应用图标必须真的打进包里 —— 用户明确要求过「macOS 程序图标」，
+  #   而图标缺失在 CI 上不会报任何错（程序照样能跑），只能在这里拦。
+  case "$1" in
+    tunnel-agent-darwin-*)
+      if [ ! -f "$WORK/tunnel-agent.app/Contents/Resources/AppIcon.icns" ]; then
+        echo "::error::$1 的 .app 里缺 Contents/Resources/AppIcon.icns（应用图标没打进去）"
+        fail=1
+      fi
+      if ! grep -q 'CFBundleIconFile' "$WORK/tunnel-agent.app/Contents/Info.plist" 2>/dev/null; then
+        echo "::error::$1 的 Info.plist 缺 CFBundleIconFile（图标不会被使用）"
+        fail=1
+      fi
+      ;;
+  esac
+
+  # ★ 可执行位：判【归档里存了什么】，而不是【解压后本机认不认它】。
+  #
+  #   原因（实测）：Windows/MSYS 的文件系统根本表示不了执行位 ——
+  #   对解出来的文件执行 `chmod 755` 之后，st_mode 仍是 0o100666，`[ -x ]` 恒为假。
+  #   于是「解压后判可执行」在开发机上永远报红（假故障），而在 Linux/macOS 上才有效。
+  #   直接看归档成员自带的权限位则各平台一致，而且它才是我们【发布出去】的东西。
+  if [ "$ARCHIVE_KIND" = "tar" ]; then
+    # ★ awk 不要 `exit`：命中后立刻退出会让仍在写输出的 tar 收到 SIGPIPE，
+    #   而脚本开头是 `set -o pipefail` ⇒ 整条命令返回 141 ⇒ set -e 当场把脚本杀掉
+    #   （实测：macOS 的 .app 归档有 4 个成员，正好触发；Linux 只有 1 个成员才没暴露）。
+    #   改用标志位读完全部输入，取第一条匹配。
+    perm=$(tar -tvzf "$f" 2>/dev/null | awk -v want="$INNER_NAME" '$NF == want && !f { print $1; f = 1 }')
+    case "$perm" in
+      "")
+        echo "::error::$1 归档里找不到 $INNER_NAME"
+        fail=1
+        ;;
+      *x*)
+        echo "  $1 -> 归档内 $INNER_NAME 权限 $perm [OK]"
+        ;;
+      *)
+        echo "::error::$1 归档内 $INNER_NAME 权限是 $perm（缺可执行位 ⇒ macOS 双击无反应）"
+        fail=1
+        ;;
+    esac
   fi
 
   desc=$(file -b "$inner")

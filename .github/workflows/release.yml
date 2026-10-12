@@ -109,7 +109,7 @@ jobs:
       #   ★ 该脚本刻意**不用关联数组**（declare -A）：runner 默认 shell 是
       #     `bash -e`，关联数组需要 bash 4+，macOS 自带的 3.2 也没有。
       - name: 校验产物架构
-        run: bash scripts/verify-artifacts.sh
+        run: bash scripts/verify-artifacts.sh dist unix
 
       - name: 生成校验和
         run: |
@@ -154,7 +154,7 @@ jobs:
 
       - name: 校验产物架构
         shell: bash
-        run: bash scripts/verify-artifacts.sh
+        run: bash scripts/verify-artifacts.sh dist macos
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
