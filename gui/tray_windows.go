@@ -4,6 +4,8 @@ package gui
 
 import (
 	"log"
+	"os"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -27,29 +29,33 @@ const (
 	nifIcon   = 0x00000002
 	nifTip    = 0x00000004
 
+	// ★ LoadImageW 的 type 参数（用于从 .ico 文件加载自定义图标）
+	imageIcon = 1 // IMAGE_ICON
+
 	swHide = 0
 )
 
 var (
-	user32               = windows.NewLazySystemDLL("user32.dll")
-	shell32              = windows.NewLazySystemDLL("shell32.dll")
-	procRegisterClassW   = user32.NewProc("RegisterClassW")
-	procCreateWindowExW  = user32.NewProc("CreateWindowExW")
-	procDefWindowProcW   = user32.NewProc("DefWindowProcW")
-	procGetMessageW      = user32.NewProc("GetMessageW")
-	procTranslateMessage = user32.NewProc("TranslateMessage")
-	procDispatchMessageW = user32.NewProc("DispatchMessageW")
-	procPostQuitMessage  = user32.NewProc("PostQuitMessage")
-	procShowWindow       = user32.NewProc("ShowWindow")
-	procDestroyWindow    = user32.NewProc("DestroyWindow")
-	procLoadIconW        = user32.NewProc("LoadIconW")
-	procLoadCursorW      = user32.NewProc("LoadCursorW")
-	procTrackPopupMenu   = user32.NewProc("TrackPopupMenu")
-	procCreatePopupMenu  = user32.NewProc("CreatePopupMenu")
-	procAppendMenuW      = user32.NewProc("AppendMenuW")
+	user32                  = windows.NewLazySystemDLL("user32.dll")
+	shell32                 = windows.NewLazySystemDLL("shell32.dll")
+	procRegisterClassW      = user32.NewProc("RegisterClassW")
+	procCreateWindowExW     = user32.NewProc("CreateWindowExW")
+	procDefWindowProcW      = user32.NewProc("DefWindowProcW")
+	procGetMessageW         = user32.NewProc("GetMessageW")
+	procTranslateMessage    = user32.NewProc("TranslateMessage")
+	procDispatchMessageW    = user32.NewProc("DispatchMessageW")
+	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
+	procShowWindow          = user32.NewProc("ShowWindow")
+	procDestroyWindow       = user32.NewProc("DestroyWindow")
+	procLoadIconW           = user32.NewProc("LoadIconW")
+	procLoadImageW          = user32.NewProc("LoadImageW") // ★ 从 .ico 加载自定义托盘图标
+	procLoadCursorW         = user32.NewProc("LoadCursorW")
+	procTrackPopupMenu      = user32.NewProc("TrackPopupMenu")
+	procCreatePopupMenu     = user32.NewProc("CreatePopupMenu")
+	procAppendMenuW         = user32.NewProc("AppendMenuW")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
-	procGetCursorPos       = user32.NewProc("GetCursorPos")
-	procShellNotifyIconW   = shell32.NewProc("Shell_NotifyIconW")
+	procGetCursorPos        = user32.NewProc("GetCursorPos")
+	procShellNotifyIconW    = shell32.NewProc("Shell_NotifyIconW")
 )
 
 type wndclass struct {
@@ -105,7 +111,7 @@ func runTray(h TrayHost) {
 	wc := wndclass{
 		lpfnWndProc:   syscall.NewCallback(wndProc),
 		hInstance:     inst,
-		hIcon:         loadIcon(32512), // IDI_APPLICATION
+		hIcon:         appIcon(), // ★ 优先 tunnel-agent.ico，回退 IDI_APPLICATION
 		hCursor:       loadCursor(32512),
 		lpszClassName: className,
 	}
@@ -225,7 +231,7 @@ func addTrayIcon(hwnd windows.Handle) {
 	nid.uID = 1
 	nid.uFlags = nifMsg | nifIcon | nifTip
 	nid.uCallbackMessage = wmTray
-	nid.hIcon = loadIcon(32512)
+	nid.hIcon = appIcon()
 	copy(nid.szTip[:], utf16("tunnel-agent"))
 	procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
 }
@@ -236,6 +242,49 @@ func delTrayIcon(hwnd windows.Handle) {
 	nid.hWnd = hwnd
 	nid.uID = 1
 	procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
+}
+
+// appIcon 优先加载随包分发的 tunnel-agent.ico；找不到则回退系统默认图标。
+//
+// ★ 原先固定用 loadIcon(32512)=IDI_APPLICATION（系统白板图标），
+//
+//	所以"换图标"这件事在 Windows 上从来没生效过。
+func appIcon() windows.Handle {
+	if h := loadAppIcon(); h != 0 {
+		return h
+	}
+	return loadIcon(32512) // IDI_APPLICATION
+}
+
+// loadAppIcon 从可执行文件同目录（或 assets/ 子目录）加载 tunnel-agent.ico。
+// 找不到时返回 0，由调用方回退 —— 保持零依赖、绝不 panic。
+func loadAppIcon() windows.Handle {
+	cands := []string{}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		cands = append(cands,
+			filepath.Join(dir, "tunnel-agent.ico"),
+			filepath.Join(dir, "assets", "tunnel-agent.ico"),
+		)
+	}
+	cands = append(cands, filepath.Join("assets", "tunnel-agent.ico"))
+	for _, c := range cands {
+		if _, err := os.Stat(c); err != nil {
+			continue
+		}
+		p, err := windows.UTF16PtrFromString(c)
+		if err != nil {
+			continue
+		}
+		// LR_LOADFROMFILE(0x0010) | LR_DEFAULTSIZE(0x0040)
+		r, _, _ := procLoadImageW.Call(0, uintptr(unsafe.Pointer(p)), imageIcon, 0, 0, 0x0010|0x0040)
+		if r != 0 {
+			log.Printf("托盘图标：已加载 %s", c)
+			return windows.Handle(r)
+		}
+	}
+	log.Println("托盘图标：未找到 tunnel-agent.ico，回退系统默认图标")
+	return 0
 }
 
 func loadIcon(id uintptr) windows.Handle {

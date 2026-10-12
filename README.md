@@ -42,15 +42,27 @@ go build -o tunnel-agent .
 ### 直接下载
 
 [Releases](https://github.com/xiujiecn/tunnel-agent/releases) 页面提供六个平台的预编译产物
-（macOS / Linux / Windows × 各自常见架构），全部静态链接，下载后 `chmod +x` 即可运行，
-并附 `SHA256SUMS.txt`。
+（macOS / Linux / Windows × 各自常见架构），并附 `SHA256SUMS.txt`。
 
-也可以自己交叉编译：
+★ **macOS 版另附 `.app` 包**（`tunnel-agent-darwin-<arch>.app.zip`）：解压后双击运行，
+图标出现在**菜单栏右上角（T）**，Dock 里不会有它 —— 这是有意的（`LSUIElement`）。
+首次打开若被系统拦截：右键 →「打开」，或 `xattr -dr com.apple.quarantine tunnel-agent.app`。
+
+Linux / Windows 版为**纯静态**（`CGO_ENABLED=0`），下载后 `chmod +x` 即可运行。
+⚠️ **macOS 版含 cgo**（状态栏用 Cocoa）⇒ 它由 macOS runner 构建，**不能从 Linux 交叉编译**；
+`go install` 在 macOS 上需要 Xcode Command Line Tools。
+
+也可以自己交叉编译（Linux / Windows）：
 
 ```bash
-CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o tunnel-agent-darwin-arm64 .
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64  go build -o tunnel-agent-windows-amd64.exe .
 CGO_ENABLED=0 GOOS=linux   GOARCH=amd64  go build -o tunnel-agent-linux-amd64 .
+```
+
+★ **macOS 不能这样交叉编译** —— 状态栏托盘走 cgo（Cocoa），必须在 macOS 上构建：
+
+```bash
+bash scripts/build-macos.sh arm64 dist   # 产出裸二进制 + .app.zip
 ```
 
 ### 校验产物架构
@@ -173,11 +185,13 @@ go test ./...       # 测试（4 条，含两条静态结构守卫）
 go vet ./...        # 静态检查
 gofmt -l .          # 格式检查，应无输出
 
-bash scripts/verify-artifacts.sh   # 校验交叉编译产物的架构（先go build 出 dist/）
+bash scripts/verify-artifacts.sh   # 校验产物架构（先 go build 出 dist/）
+bash scripts/build-macos.sh arm64 dist   # macOS 产物（需在 mac 上跑）
 ```
 
 发布：`git tag v0.1.0 && git push --tags` —— tag 会触发
 [release.yml](.github/workflows/release.yml) 构建六个平台并创建 Release。
+（Linux / Windows 在 ubuntu 上交叉编译；**macOS 单独走 macos runner**，因为托盘是 cgo。）
 
 测试里有两条**扫源码**的守卫（断言"登记发生在 `go` 语句之前"这类结构事实），
 因为那类竞态在行为层面很难稳定复现，而"写法本身就是错的"可以直接断言。

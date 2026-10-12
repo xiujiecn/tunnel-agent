@@ -64,6 +64,14 @@ func Run() error {
 		return nil
 	}
 
+	if runtime.GOOS == "darwin" {
+		// ★ macOS 的 AppKit 要求【所有 UI 操作在主线程】——
+		//   放到 goroutine 里会静默失败（状态栏图标就是不出现，且没有报错）。
+		//   所以和 Windows 一样：直接在主线程跑事件循环，让它阻塞到底。
+		runTray(host)
+		return nil
+	}
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
