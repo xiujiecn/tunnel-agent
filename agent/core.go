@@ -37,6 +37,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -50,19 +51,20 @@ import (
 //	而报文里只是一个看不懂的 type 字符串。注释里写明"改这里也要改那里"，
 //	并在本文件里给出与 Go 侧常量的对照表。
 const (
-	frameRequest      = "request"  // 服务端 → agent：开始一次本地请求
-	frameRequestBody  = "reqBody"  // 服务端 → agent：请求体数据块
-	frameRequestEnd   = "reqEnd"   // 服务端 → agent：请求体结束
-	frameResponse     = "response" // agent → 服务端：响应头
-	frameResponseBody = "resBody"  // agent → 服务端：响应体数据块
-	frameResponseEnd  = "resEnd"   // agent → 服务端：响应结束
-	frameError        = "error"    // agent → 服务端：本地请求失败
-	frameClose        = "close"    // 服务端 → agent：隧道已关闭，优雅退出
-	framePing         = "ping"
-	framePong         = "pong"
-	frameStreamOpen   = "streamOpen"  // 服务端 → agent：开一条 WebSocket 透传
-	frameStreamClose  = "streamClose" // 双向：关闭某条透传流
-	frameStreamBinary = "streamBin"   // 双向：透传流的原始字节
+	frameRequest          = "request"  // 服务端 → agent：开始一次本地请求
+	frameRequestBody      = "reqBody"  // 服务端 → agent：请求体数据块
+	frameRequestEnd       = "reqEnd"   // 服务端 → agent：请求体结束
+	frameResponse         = "response" // agent → 服务端：响应头
+	frameResponseBody     = "resBody"  // agent → 服务端：响应体数据块
+	frameResponseEnd      = "resEnd"   // agent → 服务端：响应结束
+	frameError            = "error"    // agent → 服务端：本地请求失败
+	frameClose            = "close"    // 服务端 → agent：隧道已关闭，优雅退出
+	framePing             = "ping"
+	framePong             = "pong"
+	frameStreamOpen       = "streamOpen"       // 服务端 → agent：开流（HTTP-WS / TCP / UDP）
+	frameStreamOpenResult = "streamOpenResult" // agent → 服务端：本地 dial 成败
+	frameStreamClose      = "streamClose"      // 双向：关闭某条透传流
+	frameStreamBinary     = "streamBin"        // 双向：透传流的原始字节
 )
 
 // frame 一帧（字段与服务端 Frame 结构体对应）。
@@ -80,6 +82,10 @@ type frame struct {
 	DataBase64    string              `json:"data,omitempty"`
 	Upgrade       bool                `json:"upgrade,omitempty"`
 	UpgradeHeader map[string]string   `json:"upgradeHeader,omitempty"`
+	Proto         string              `json:"proto,omitempty"`
+	Remote        string              `json:"remote,omitempty"`
+	Local         string              `json:"local,omitempty"`
+	Ok            *bool               `json:"ok,omitempty"`
 }
 
 // bodyChunk 单帧正文大小上限（与服务端 tunnelBodyChunk 一致：64KB）。
@@ -91,6 +97,19 @@ type Config struct {
 	Token     string
 	LocalAddr string
 	Verbose   bool
+	// Proto 协议：http（默认）| tcp | udp。缺省必须保持旧行为。
+	Proto string
+}
+
+// NormalizeProto 空 / 未知 → http（旧脚本不加 -proto 仍只跑 HTTP）。
+func NormalizeProto(p string) string {
+	p = strings.TrimSpace(strings.ToLower(p))
+	switch p {
+	case "tcp", "udp":
+		return p
+	default:
+		return "http"
+	}
 }
 
 // Run 启动隧道转发，阻塞直到 ctx 结束或不可恢复错误。
@@ -99,6 +118,7 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 	if cfg.LocalAddr == "" {
 		cfg.LocalAddr = "127.0.0.1:3000"
 	}
+	cfg.Proto = NormalizeProto(cfg.Proto)
 	if err := CheckLocalAddr(cfg.LocalAddr); err != nil {
 		var warning *warningError
 		if errors.As(err, &warning) {
@@ -112,6 +132,7 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 		serverURL:   cfg.ServerURL,
 		token:       cfg.Token,
 		localAddr:   cfg.LocalAddr,
+		proto:       cfg.Proto,
 		verbose:     cfg.Verbose,
 		localClient: NewLocalClient(),
 		out:         out,
@@ -132,17 +153,19 @@ func usage(w io.Writer) {
 
 用法：
   tunnel-agent -server wss://tool.xiujie.cn/api/v1/tunnel/agent/attach -token <票据> -local 127.0.0.1:3000
+  tunnel-agent -proto tcp -server … -token … -local 127.0.0.1:22
 
 参数：
   -server   服务端 agent 接入地址（必填）
-  -token    绑定票据（必填，一次性；过期后在页面上重新获取）
+  -token    绑定票据（必填；换发后旧票失效）
   -local    本地服务地址，默认 127.0.0.1:3000
+  -proto    协议：http（默认）| tcp | udp；必须与隧道创建时一致
   -v        打印每条请求的转发明细
 
 说明：
   · 本工具会把你指定的本地服务**临时暴露到公网**，
     任何拿到公网地址的人都能访问它。请只分享给确实需要访问的人。
-  · 票据是一次性的，用掉即失效；agent 断线重连时需要在页面上重新获取。
+  · 票据换发或关隧道后旧票失效；请用页面最新启动命令。
   · 本地地址只允许回环或私有网段（见启动时的检查）——
     它不是安全边界，而是一道防手滑的闸：把 -local 写成某个内网 IP
     会让你的 agent 变成访问那台机器的跳板。
@@ -154,6 +177,7 @@ type agentRuntime struct {
 	serverURL string
 	token     string
 	localAddr string
+	proto     string
 	verbose   bool
 	out       io.Writer
 
@@ -231,10 +255,15 @@ func NewLocalClient() *http.Client {
 
 func (rt *agentRuntime) run(ctx context.Context) error {
 	attempt := 0
+	// ★★ P1：记录"这一把连接是从什么时候开始建立的"——用来算存活时长。
+	connectedAt := time.Time{}
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
+		// ★ 必须在 connectOnce **之前**取时间：connectOnce 返回时连接已经结束，
+		//   事后取会把存活时长算成 0（那正是"永远复位/永不���位"的反向错误）。
+		connectedAt = time.Now()
 		err := rt.connectOnce(ctx)
 		if ctx.Err() != nil {
 			return nil
@@ -243,19 +272,51 @@ func (rt *agentRuntime) run(ctx context.Context) error {
 		//   旧实现对一切断开都退避重试 ⇒ 复用废票时永远「1s 后重连」。
 		if errors.Is(err, ErrFatalConnect) || errors.Is(err, errTunnelClosed) {
 			rt.emitf("%v\n", err)
-			rt.emitln("已停止重连。请到秀杰工作台「内网穿透」页点「换发启动命令」，再用新命令启动。")
+			if strings.Contains(err.Error(), AgentOutdatedHint) {
+				rt.emitln("已停止重连。请按上方提示重新下载 tunnel-agent 并用新启动命令启动。")
+			} else {
+				rt.emitln("已停止重连。请到秀杰工作台「内网穿透」页点「换发启动命令」，再用新命令启动。")
+			}
 			return err
 		}
-		// ★ 瞬时故障：网络抖动 / 服务端重启 —— 保持退避重连。
+		// ★ 软轮换：已在 serve 内完成 make-before-break（或仅主动拆旧），立即再挂，无退避。
+		if errors.Is(err, errSoftRecycle) {
+			attempt = 0
+			rt.emitf("软轮换结束（本段存活 %s），立即继续…\n", time.Since(connectedAt).Round(time.Second))
+			continue
+		}
+		// ★★★ P1：连上过、且**活得够久**（超过一个心跳周期）⇒ 判定链路健康，
+		//	把退避计数**清零**。
+		attempt = nextAttemptAfterDisconnect(attempt, time.Since(connectedAt))
 		attempt++
 		delay := backoff(attempt)
-		rt.emitf("隧道已断开（%v），%s 后重连（第 %d 次）…\n", err, delay.Round(time.Second), attempt)
+		rt.emitf("隧道已断开（%v，连接存活 %s），%s 后重连（第 %d 次）…\n",
+			err, time.Since(connectedAt).Round(time.Second), delay.Round(time.Second), attempt)
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(delay):
 		}
 	}
+}
+
+// nextAttemptAfterDisconnect 断开后计算下一次重连的 attempt 计数。
+//
+// ★ P1：修复"连接稳定跑过很久、一次抖动后却永远卡在 30s 封顶"——
+//
+//	只要这一把连接**活过���个心跳周期**，就认为链路是通的，
+//	把退避计数清零（快速恢复到 1s）；否则保留原计数继续递增。
+//
+//	判据用"活过 agentPingInterval"而不是"任意时长"，是为了**防重连风暴**：
+//	"连上就断"的链路若每次都清零，退避会永远停在 1s ⇒ 每秒一次连接尝试，
+//	既打服务端又耗本地资源。所以短命连接**不清零**。
+//
+// 纯函数（无 IO），便于直接单测锁死这条语义。
+func nextAttemptAfterDisconnect(attempt int, aliveFor time.Duration) int {
+	if aliveFor > agentPingInterval {
+		return 0
+	}
+	return attempt
 }
 
 // errTunnelClosed 服务端明确告知隧道已关闭。
@@ -283,80 +344,68 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// connectOnce 建一次连接并处理到断开。
+// connectOnce 建一次连接并处理到断开（期间可软轮换多次）。
 func (rt *agentRuntime) connectOnce(ctx context.Context) error {
-	endpoint, err := attachURL(rt.serverURL, rt.token)
+	conn, err := rt.dialWS(ctx)
 	if err != nil {
 		return err
 	}
+	localBase, _ := rt.localBaseURL()
+	rt.emitf("已连接：本地 %s  <-->  %s\n", rt.localAddr, rt.serverURL)
+
+	for {
+		go func(c *websocket.Conn) {
+			<-ctx.Done()
+			_ = c.Close()
+		}(conn)
+
+		next, serveErr := rt.serve(ctx, conn, localBase)
+		if next != nil && serveErr == nil {
+			// make-before-break：新连接已在服务端接管，切过去继续。
+			_ = conn.Close()
+			conn = next
+			rt.emitf("软轮换切换完成（新连接已接管），继续服务\n")
+			continue
+		}
+		_ = conn.Close()
+		if next != nil {
+			_ = next.Close()
+		}
+		if serveErr == nil {
+			return nil
+		}
+		return classifyServeError(serveErr)
+	}
+}
+
+// dialWS 拨号并完成 WS 升级（软轮换与首连共用）。
+func (rt *agentRuntime) dialWS(ctx context.Context) (*websocket.Conn, error) {
+	endpoint, err := attachURL(rt.serverURL, rt.token, rt.proto)
+	if err != nil {
+		return nil, err
+	}
 	dialer := &websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
-		// ★ TLS：允许自签名/私有 CA 的开发场景通过 -insecure 打开，
-		//   但默认是校验的（生产必须是 https/wss，不能为了方便关掉）。
-		//
-		// ★ NextProtos 只留 http/1.1 —— **必须显式写这一行**：
-		//
-		//	WebSocket 走的是 RFC 6455 的 HTTP/1.1 Upgrade 握手。
-		//	若不限制 ALPN，Go 会与 nginx 协商出 h2，而 h2 走 RFC 8441
-		//	（Extended CONNECT）—— nginx 1.24 这条路径会把 Upgrade 头剥掉，
-		//	后端收到的是「没有 upgrade token 的普通请求」，
-		//	日志表现为 `the client is not using the websocket protocol:
-		//	'upgrade' token not found in 'Connection' header`。
-		//
-		//	★ 为什么难查：这个 400 只在**真实 nginx + TLS** 下出现，
-		//	  而 gorilla/websocket 本身只实现 h1 1.1，
-		//	  于是同一份代码在本地 dev（vite 代理）与容器内直连都正常，
-		//	  一放到有 h2 的 nginx 后面就恒定 bad handshake。
+		NetDialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			NextProtos: []string{"http/1.1"},
 		},
-		// ★ Proxy 显式 nil：握手**不走任何环境代理**。
-		//
-		//	与本地转发（newLocalClient）是同一条纪律，但这里的危害更大：
-		//	gorilla 的 Dialer 默认 Proxy 是 http.ProxyFromEnvironment，
-		//	而它对 **wss:// 走的是 HTTP CONNECT 隧道** ——
-		//	绝大多数企业代理只放行 443 上的普通 HTTPS，
-		//	对 CONNECT 目标再套一层 TLS 的做法要么直接拒绝、
-		//	要么把 Upgrade 头剥掉。
-		//
-		//	症状极具迷惑性（本次真实踩到）：
-		//	- agent 侧：`websocket: bad handshake`（拿不到状态码与响应体）；
-		//	- 服务端侧：**一条日志都没有**（请求根本没到）；
-		//	- 而同一时刻用 curl 从同一台机器访问同一URL 完全正常
-		//	  （curl 走的是同一个代理，但它对无Origin 的 WS 请求处理不同）。
-		//	⇒ 看起来像"服务端把 agent 拒了"，实际是 agent 压根没连上。
-		//
-		//	★ 而握手的目标是**用户自己填的公网地址**，
-		//	  让企业代理代转这条连接既不必要、也不该发生（它能看到票据）。
 		Proxy:             nil,
 		EnableCompression: false,
 	}
 	conn, resp, err := dialer.DialContext(ctx, endpoint, nil)
 	if err != nil {
-		// ★ Dial 失败时 resp 仍可能带 401 body（票据类）—— 必须读出来再分类，
-		//   否则又退化成「连接失败」+ 无限重连。
-		return classifyDialError(err, resp)
+		return nil, classifyDialError(err, resp)
 	}
-	defer conn.Close()
-
-	// ★ 握手被拒时把状态码打出来：它区分了"隧道已关/ 票据过期"（401）
-	//   与"服务端没开这个功能"（503）与"路径错了"（404）——
-	//   而这三个在浏览器里都只表现为"连接失败"。
 	if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
-		return classifyDialError(fmt.Errorf("bad handshake"), resp)
-	}
-
-	localBase, _ := rt.localBaseURL()
-	rt.emitf("已连接：本地 %s  <-->  %s\n", rt.localAddr, rt.serverURL)
-
-	// 关闭信号 → 主动关连接（让服务端侧也立刻知道）。
-	go func() {
-		<-ctx.Done()
 		_ = conn.Close()
-	}()
-
-	return classifyServeError(rt.serve(ctx, conn, localBase))
+		return nil, classifyDialError(fmt.Errorf("bad handshake"), resp)
+	}
+	return conn, nil
 }
 
 // attachURL 把 -server 与 -token 拼成带票据的 WS 地址。
@@ -365,7 +414,7 @@ func (rt *agentRuntime) connectOnce(ctx context.Context) error {
 //
 //	用 header 传会更"干净"，但服务端这条路由不挂鉴权中间件（WS 无法过
 //	middleware.RequireLogin —— agent 没有用户的JWT），所以票据就是这条路由的凭证。
-func attachURL(serverURL, token string) (string, error) {
+func attachURL(serverURL, token, proto string) (string, error) {
 	u, err := url.Parse(serverURL)
 	if err != nil {
 		return "", fmt.Errorf("服务端地址不合法：%w", err)
@@ -384,6 +433,11 @@ func attachURL(serverURL, token string) (string, error) {
 	}
 	q := u.Query()
 	q.Set("ticket", token)
+	q.Set("agentVer", Version) // 服务端日志/兼容策略用；不参与验签
+	proto = NormalizeProto(proto)
+	if proto != "http" {
+		q.Set("proto", proto) // 服务端校验与隧道记录一致（80012）
+	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }
@@ -404,36 +458,179 @@ func (rt *agentRuntime) localBaseURL() (*url.URL, error) {
 	return u, nil
 }
 
-// serve 处理连接上的帧，直到断开。
-func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBase *url.URL) error {
+// 心跳 / 软轮换参数（与服务端 logic/tunnel/heartbeat.go 对齐）。
+//
+//	★ 2026-10-11 实测：裸 TCP 空闲 ≈60s 被关；隧道常见恰好活 40s + 1006。
+//	  代码里没有 40 —— 病灶在链路；药方 = 更密的双向 Text 心跳 + 阈值前软轮换。
+const (
+	agentPingInterval    = 10 * time.Second
+	agentReadIdleTimeout = 90 * time.Second
+	// 等 pong：须 > ping 间隔，避免偶发慢往返误杀；取 2.5×ping。
+	agentPongTimeout = 25 * time.Second
+	// softRecycleAfter：在链路 ~40s 掐断之前主动换连接。
+	// ★ 0 = 关闭软轮换（破坏性验证用：应复现 40s 断连）。
+	//   默认 35s：先 Dial 新连接（服务端接管）再拆旧 = make-before-break，空窗≈RTT。
+	softRecycleAfter = 35 * time.Second
+)
+
+// errSoftRecycle 软轮换：非故障，run 循环应立即接上（无退避）。
+var errSoftRecycle = errors.New("soft recycle: 主动换连接以避开链路空闲掐断")
+
+// serve 处理连接上的帧，直到断开或软轮换。
+//
+//	返回 (next, nil)：软轮换已拨好新连接，调用方应切到 next 继续；
+//	返回 (nil, errSoftRecycle)：已拆旧但 Dial 新连接失败，外层立即重连；
+//	返回 (nil, other)：真断开。
+func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBase *url.URL) (*websocket.Conn, error) {
 	//写锁：多个在途请求会并发往这条连接写响应帧，而 gorilla 不允许并发写。
 	var writeMu sync.Mutex
 	// 透传流表（WebSocket 透传）：streamId → 它的本地 TCP 连接。
 	var streamMu sync.Mutex
 	streams := make(map[string]net.Conn)
 
-	// 服务端 ping → 回 pong（否则服务端会在读超时后掐断这条连接）。
-	conn.SetPongHandler(func(string) error { return nil })
+	var lastServerAlive sync.Mutex
+	aliveAt := time.Now()
+	touchAlive := func() {
+		lastServerAlive.Lock()
+		aliveAt = time.Now()
+		lastServerAlive.Unlock()
+		_ = conn.SetReadDeadline(time.Now().Add(agentReadIdleTimeout))
+	}
+	isStale := func() bool {
+		lastServerAlive.Lock()
+		defer lastServerAlive.Unlock()
+		return time.Since(aliveAt) > agentReadIdleTimeout
+	}
+	touchAlive()
+
+	conn.SetPongHandler(func(string) error {
+		touchAlive()
+		return nil
+	})
+
+	type pingTracker struct {
+		mu      sync.Mutex
+		sentAt  time.Time
+		ackedAt time.Time
+		pongN   int
+	}
+	var tracker pingTracker
+	markPong := func() {
+		tracker.mu.Lock()
+		tracker.ackedAt = time.Now()
+		tracker.pongN++
+		n := tracker.pongN
+		sent := tracker.sentAt
+		tracker.mu.Unlock()
+		// ★ 可运行证据：pong 闭环计数（每 6 次≈1 分钟打一条）。
+		if n == 1 || n%6 == 0 {
+			rtt := time.Duration(0)
+			if !sent.IsZero() {
+				rtt = time.Since(sent)
+			}
+			rt.emitf("应用层心跳确认 pong#%d（RTT≈%s，证明服务端回了 Text FramePong）\n",
+				n, rtt.Round(time.Millisecond))
+		}
+	}
+
+	sendPing := func() bool {
+		if isStale() {
+			_ = conn.Close()
+			return false
+		}
+		writeMu.Lock()
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		err := conn.WriteMessage(websocket.TextMessage, mustJSON(frame{Type: framePing}))
+		sent := time.Now()
+		if err == nil {
+			tracker.mu.Lock()
+			tracker.sentAt = sent
+			tracker.mu.Unlock()
+		}
+		writeMu.Unlock()
+		if err != nil {
+			_ = conn.Close()
+			return false
+		}
+		go func(sentAt time.Time) {
+			deadline := time.NewTimer(agentPongTimeout)
+			defer deadline.Stop()
+			tick := time.NewTicker(200 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-deadline.C:
+					tracker.mu.Lock()
+					stale := tracker.ackedAt.Before(sentAt)
+					tracker.mu.Unlock()
+					if stale {
+						rt.emitf("应用层心跳未收到 pong（发出已超过 %s，判定链路半死，主动断开重连）\n",
+							agentPongTimeout)
+						_ = conn.Close()
+					}
+					return
+				case <-tick.C:
+					tracker.mu.Lock()
+					ok := tracker.ackedAt.After(sentAt)
+					tracker.mu.Unlock()
+					if ok {
+						return
+					}
+				}
+			}
+		}(sent)
+		return true
+	}
+
+	// ★ 立刻第一拍（Ticker 要等满间隔才首次触发，旧行为空窗 = 一整拍）。
+	if !sendPing() {
+		return nil, fmt.Errorf("与服务端的连接断开：首拍心跳写出失败")
+	}
+
 	go func() {
-		ticker := time.NewTicker(20 * time.Second)
+		ticker := time.NewTicker(agentPingInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				writeMu.Lock()
-				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				err := conn.WriteMessage(websocket.TextMessage, mustJSON(frame{Type: framePing}))
-				writeMu.Unlock()
-				if err != nil {
+				if !sendPing() {
 					return
 				}
 			}
 		}
 	}()
 
+	// ★ 软轮换：阈值（~40s）前 make-before-break。
+	var softArmed atomic.Bool
+	var handoff atomic.Pointer[websocket.Conn]
+	if softRecycleAfter > 0 {
+		go func() {
+			t := time.NewTimer(softRecycleAfter)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				rt.emitf("软轮换：本连接已满 %s（低于链路 ~40s 掐断），先建新再拆旧…\n", softRecycleAfter)
+				newConn, dialErr := rt.dialWS(ctx)
+				softArmed.Store(true)
+				if dialErr != nil {
+					rt.emitf("软轮换 Dial 失败：%v —— 拆旧后由外层立即重连\n", dialErr)
+					_ = conn.Close()
+					return
+				}
+				handoff.Store(newConn)
+				_ = conn.Close() // 若服务端已因接管关旧，此处幂等
+			}
+		}()
+	}
+
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(agentReadIdleTimeout))
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
 			streamMu.Lock()
@@ -441,8 +638,15 @@ func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBa
 				_ = c.Close()
 			}
 			streamMu.Unlock()
-			return fmt.Errorf("与服务端的连接断开：%w", err)
+			if softArmed.Load() {
+				if next := handoff.Load(); next != nil {
+					return next, nil
+				}
+				return nil, errSoftRecycle
+			}
+			return nil, fmt.Errorf("与服务端的连接断开：%w", err)
 		}
+		touchAlive()
 		var f frame
 		if err := json.Unmarshal(payload, &f); err != nil {
 			// ★ 畸形帧只跳过这一帧：不终止连接。
@@ -450,6 +654,9 @@ func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBa
 			continue
 		}
 		switch f.Type {
+		case framePong:
+			// 服务端对我们 ping 的应答；touchAlive 已在读到时做过。
+			markPong()
 		case frameRequest:
 			// ★ 请求体中转缓冲必须在**启动 goroutine 之前**登记好：
 			//   reqBody 帧是在当前读循环里紧接着处理的，而新协程何时开跑不确定 ——
@@ -469,7 +676,7 @@ func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBa
 		case frameRequestEnd:
 			rt.closeRequestBody(f.ID)
 		case frameClose:
-			return fmt.Errorf("%w: %w", ErrFatalConnect, errTunnelClosed)
+			return nil, fmt.Errorf("%w: %w", ErrFatalConnect, errTunnelClosed)
 		case frameStreamOpen:
 			go rt.openStream(conn, &writeMu, &streamMu, streams, localBase, f)
 		case frameStreamBinary:
@@ -478,6 +685,7 @@ func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBa
 			rt.closeStream(streams, &streamMu, f.StreamID)
 		case framePing:
 			writeMu.Lock()
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			_ = conn.WriteMessage(websocket.TextMessage, mustJSON(frame{Type: framePong}))
 			writeMu.Unlock()
 		}
@@ -736,14 +944,24 @@ func (rt *agentRuntime) sendError(conn *websocket.Conn, writeMu *sync.Mutex, id,
 
 // openStream 开一条透传流：与本地服务建立**裸 TCP** 连接，之后字节直通。
 //
-// ★ 为什么是裸 TCP 而不是让本地侧也用 WebSocket 客户端：
+// ★ proto=tcp/udp：裸 dial + streamOpenResult，无 HTTP 握手。
+// ★ proto 缺省/空：HTTP-WS 透传（旧行为）—— 把 Upgrade 头原样写给本地。
 //
-//	我们要做的是**字节搬运**，不是参与 WebSocket 协议。
-//	握手那一段由服务端把访客的原始头带过来（f.UpgradeHeader），
-//	我们在本地侧直接把那些字节写进 TCP 连接，让本地服务看到一次**真实的**
-//	WebSocket 握手 —— 它返回的 101 与 Sec-WebSocket-Accept 会原样经服务端转回访客。
-//	自己算 Accept 是协议上最危险的做法（算错就是"连上了但立刻断开"）。
+// ★ 有效 proto = 帧内 proto；空则回退到 agent -proto。
+//
+//	否则：用户已用 -proto tcp 连上，但帧里 proto 丢失/旧服务端未填时，
+//	会误走 HTTP-WS 路径且**不发 streamOpenResult** ⇒ 服务端 WaitStreamOpen
+//	超时 ⇒ 公网侧表现为 dial 通但 recv=b''（且本进程无任何 dial 日志）。
 func (rt *agentRuntime) openStream(conn *websocket.Conn, writeMu *sync.Mutex, streamMu *sync.Mutex, streams map[string]net.Conn, localBase *url.URL, f frame) {
+	proto := effectiveStreamProto(f.Proto, rt.proto)
+	if proto == "tcp" || proto == "udp" {
+		rt.emitf("streamOpen id=%s proto=%s local=%s remote=%s\n",
+			f.StreamID, proto, strings.TrimSpace(f.Local), strings.TrimSpace(f.Remote))
+		rt.openRawStream(conn, writeMu, streamMu, streams, f)
+		return
+	}
+	rt.emitf("streamOpen id=%s proto=http-ws（帧proto=%q agent=-proto %s）\n",
+		f.StreamID, f.Proto, NormalizeProto(rt.proto))
 	host := localBase.Host
 	if _, _, err := net.SplitHostPort(host); err != nil {
 		// 没有端口时补本地服务的默认端口假设（http 80）。
@@ -781,16 +999,64 @@ func (rt *agentRuntime) openStream(conn *websocket.Conn, writeMu *sync.Mutex, st
 		return
 	}
 
-	// ---- 本地 → 服务端 ----
+	rt.pumpLocalToServer(conn, writeMu, streamMu, streams, local, f.StreamID)
+}
+
+// effectiveStreamProto 帧 proto 优先；空则用 agent -proto（Normalize 后）。
+func effectiveStreamProto(frameProto, agentProto string) string {
+	p := strings.TrimSpace(strings.ToLower(frameProto))
+	if p == "tcp" || p == "udp" {
+		return p
+	}
+	if p != "" {
+		return p
+	}
+	return NormalizeProto(agentProto)
+}
+
+// openRawStream TCP/UDP：dial 本地 → streamOpenResult → 双向 streamBin。
+func (rt *agentRuntime) openRawStream(conn *websocket.Conn, writeMu *sync.Mutex, streamMu *sync.Mutex, streams map[string]net.Conn, f frame) {
+	dialAddr := strings.TrimSpace(f.Local)
+	if dialAddr == "" {
+		dialAddr = rt.localAddr
+	}
+	okFalse := false
+	okTrue := true
+	sendResult := func(ok bool, msg string) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		fr := frame{Type: frameStreamOpenResult, StreamID: f.StreamID, Ok: &okFalse, Message: msg}
+		if ok {
+			fr.Ok = &okTrue
+			fr.Message = ""
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, mustJSON(fr))
+	}
+	rt.emitf("dial 本地 %s（stream=%s）…\n", dialAddr, f.StreamID)
+	local, err := net.DialTimeout("tcp", dialAddr, 10*time.Second)
+	if err != nil {
+		rt.emitf("dial 本地失败 stream=%s addr=%s：%v\n", f.StreamID, dialAddr, err)
+		sendResult(false, fmt.Sprintf("本地拒绝连接：%v", err))
+		return
+	}
+	streamMu.Lock()
+	streams[f.StreamID] = local
+	streamMu.Unlock()
+	rt.emitf("dial 本地成功 stream=%s addr=%s\n", f.StreamID, dialAddr)
+	sendResult(true, "")
+	rt.pumpLocalToServer(conn, writeMu, streamMu, streams, local, f.StreamID)
+}
+
+func (rt *agentRuntime) pumpLocalToServer(conn *websocket.Conn, writeMu *sync.Mutex, streamMu *sync.Mutex, streams map[string]net.Conn, local net.Conn, streamID string) {
 	go func() {
 		defer func() {
 			streamMu.Lock()
-			delete(streams, f.StreamID)
+			delete(streams, streamID)
 			streamMu.Unlock()
 			_ = local.Close()
 			writeMu.Lock()
 			_ = conn.WriteMessage(websocket.TextMessage, mustJSON(frame{
-				Type: frameStreamClose, StreamID: f.StreamID,
+				Type: frameStreamClose, StreamID: streamID,
 			}))
 			writeMu.Unlock()
 		}()
@@ -802,7 +1068,7 @@ func (rt *agentRuntime) openStream(conn *websocket.Conn, writeMu *sync.Mutex, st
 				_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 				werr := conn.WriteMessage(websocket.TextMessage, mustJSON(frame{
 					Type:       frameStreamBinary,
-					StreamID:   f.StreamID,
+					StreamID:   streamID,
 					DataBase64: base64.StdEncoding.EncodeToString(buf[:n]),
 				}))
 				writeMu.Unlock()

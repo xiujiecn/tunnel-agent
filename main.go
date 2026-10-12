@@ -19,6 +19,7 @@ func main() {
 		serverURL = flag.String("server", "", "服务端 agent 接入地址（ws:// 或 wss://）")
 		token     = flag.String("token", "", "绑定票据（从秀杰工作台「内网穿透」页面获取）")
 		local     = flag.String("local", "127.0.0.1:3000", "本地服务地址 host:port")
+		proto     = flag.String("proto", "http", "协议：http（默认）| tcp | udp")
 		verbose   = flag.Bool("v", false, "打印每条请求的转发明细")
 		guiMode   = flag.Bool("gui", false, "强制打开图形控制台")
 	)
@@ -44,6 +45,7 @@ func main() {
 		ServerURL: *serverURL,
 		Token:     *token,
 		LocalAddr: *local,
+		Proto:     *proto,
 		Verbose:   *verbose,
 	}, nil); err != nil {
 		log.Fatalf("隧道已断开：%v", err)

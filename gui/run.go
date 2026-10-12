@@ -51,9 +51,10 @@ func Run() error {
 	}
 
 	host := TrayHost{
-		Show: func() { showUI() },
-		Stop: func() { ctrl.Stop() },
-		Quit: doQuit,
+		Show:   func() { showUI() },
+		Stop:   func() { ctrl.Stop() },
+		Quit:   doQuit,
+		Notify: func(msg string) { ctrl.logs.Append(msg) },
 	}
 
 	runHostWindow(host, baseURL)
@@ -66,8 +67,8 @@ func Run() error {
 
 	if runtime.GOOS == "darwin" {
 		// ★ macOS 的 AppKit 要求【所有 UI 操作在主线程】——
-		//   放到 goroutine 里会静默失败（状态栏图标就是不出现，且没有报错）。
-		//   所以和 Windows 一样：直接在主线程跑事件循环，让它阻塞到底。
+		//   放到 goroutine 里会静默失败（状态栏图标根本不出现）。
+		//   因此和 Windows 一样：直接在主线程跑事件循环。
 		runTray(host)
 		return nil
 	}

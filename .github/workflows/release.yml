@@ -64,26 +64,40 @@ jobs:
       - name: 单元测试
         run: go test ./... -count=1
 
-      - name: 交叉编译
+      - name: 交叉编译并打包
         env:
           CGO_ENABLED: '0'
         run: |
           set -euo pipefail
           mkdir -p dist
+          DIST="$(pwd)/dist"
           # ★ macOS 已从这里移除：托盘走 cgo（Cocoa），必须在 mac runner 上编，
           #   见下方 build-macos job。CGO_ENABLED=0 编 darwin 会报 undefined。
+          #
+          # ★ 产物只出压缩包，不出裸二进制：
+          #   裸文件没有扩展名，浏览器当未知类型、Gatekeeper 直接拦，
+          #   下载页也从不下发它 —— 发出去只会让「该下哪个」变成一道选择题。
           for target in \
             linux/amd64 linux/arm64 \
             windows/amd64 windows/arm64
           do
             os="${target%%/*}"
             arch="${target##*/}"
-            out="dist/tunnel-agent-${os}-${arch}"
-            [ "$os" = "windows" ] && out="${out}.exe"
+            work="$(mktemp -d)"
             echo "▶ $os/$arch"
-            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$out" .
-            ls -lh "$out"
+
+            if [ "$os" = "windows" ]; then
+              GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$work/tunnel-agent.exe" .
+              # ★ 用绝对路径：子 shell 里 $OLDPWD 依赖 cd 的行为，不可靠
+              (cd "$work" && zip -q "$DIST/tunnel-agent-${os}-${arch}.zip" tunnel-agent.exe)
+            else
+              GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$work/tunnel-agent" .
+              chmod 755 "$work/tunnel-agent"
+              tar -czf "dist/tunnel-agent-${os}-${arch}.tar.gz" -C "$work" tunnel-agent
+            fi
+            rm -rf "$work"
           done
+          ls -lh dist/
 
       # ★ 校验每个产物都是预期的平台 —— 交叉编译最容易出的错是
       #   "环境变量没生效，于是六个文件其实是同一种架构"。
@@ -203,18 +217,28 @@ jobs:
 
           | 平台 | 文件 |
           |---|---|
-          | macOS (Apple 芯片) | \`tunnel-agent-darwin-arm64\` |
-          | macOS (Intel) | \`tunnel-agent-darwin-amd64\` |
-          | Linux (x86_64) | \`tunnel-agent-linux-amd64\` |
-          | Linux (ARM64) | \`tunnel-agent-linux-arm64\` |
-          | Windows (x64) | \`tunnel-agent-windows-amd64.exe\` |
-          | Windows (ARM64) | \`tunnel-agent-windows-arm64.exe\` |
+          | macOS (Apple 芯片) | \`tunnel-agent-darwin-arm64.tar.gz\` ★ 推荐 |
+          | macOS (Intel) | \`tunnel-agent-darwin-amd64.tar.gz\` ★ 推荐 |
+          | Linux (x86_64) | \`tunnel-agent-linux-amd64.tar.gz\` |
+          | Linux (ARM64) | \`tunnel-agent-linux-arm64.tar.gz\` |
+          | Windows (x64) | \`tunnel-agent-windows-amd64.zip\` |
+          | Windows (ARM64) | \`tunnel-agent-windows-arm64.zip\` |
 
-          Linux / Windows 为纯静态（\`CGO_ENABLED=0\`），下载后先加执行权限：
+          ★ **只发布压缩包**（裸二进制不再发布）：浏览器会给无扩展名的文件乱贴类型，
+          macOS Gatekeeper 也会直接拦 —— 解压后再运行才靠得住。
+
+          **macOS**：解压得到 \`tunnel-agent.app\`，双击即可 —— 图标出现在**菜单栏右上角（T）**，
+          不占 Dock（这是有意的 \`LSUIElement\`）。首次打开若被拦：
+          右键 →「打开」，或 \`xattr -dr com.apple.quarantine tunnel-agent.app\`。
+
+          **Linux**：解压后加执行权限 ——
 
           \`\`\`bash
-          chmod +x tunnel-agent-*
+          tar -xzf tunnel-agent-linux-*.tar.gz
+          chmod +x tunnel-agent
           \`\`\`
+
+          **Windows**：解压 zip 得到 \`tunnel-agent.exe\`，双击即可。
 
           校验和见 \`SHA256SUMS.txt\`。
 

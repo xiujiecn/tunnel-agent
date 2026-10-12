@@ -19,18 +19,14 @@ const (
 	wmCommand = 0x0111
 	wmTray    = 0x0400 + 1
 
-	idmShow = 1001
-	idmStop = 1002
-	idmQuit = 1003
-
 	nimAdd    = 0x00000000
 	nimDelete = 0x00000002
 	nifMsg    = 0x00000001
 	nifIcon   = 0x00000002
+	imageIcon = 1 // IMAGE_ICON
 	nifTip    = 0x00000004
 
-	// ★ LoadImageW 的 type 参数（用于从 .ico 文件加载自定义图标）
-	imageIcon = 1 // IMAGE_ICON
+	mfSeparator = 0x00000800
 
 	swHide = 0
 )
@@ -48,7 +44,7 @@ var (
 	procShowWindow          = user32.NewProc("ShowWindow")
 	procDestroyWindow       = user32.NewProc("DestroyWindow")
 	procLoadIconW           = user32.NewProc("LoadIconW")
-	procLoadImageW          = user32.NewProc("LoadImageW") // ★ 从 .ico 加载自定义托盘图标
+	procLoadImageW          = user32.NewProc("LoadImageW") // ★ 用于从 .ico 文件加载自定义托盘图标
 	procLoadCursorW         = user32.NewProc("LoadCursorW")
 	procTrackPopupMenu      = user32.NewProc("TrackPopupMenu")
 	procCreatePopupMenu     = user32.NewProc("CreatePopupMenu")
@@ -95,8 +91,6 @@ type msg struct {
 }
 
 var (
-	host     TrayHost
-	hostURL  string
 	hostHWND windows.Handle
 	inst     windows.Handle
 )
@@ -138,8 +132,8 @@ func runTray(h TrayHost) {
 }
 
 func runHostWindow(h TrayHost, baseURL string) {
+	host = h
 	hostURL = baseURL
-	_ = h
 }
 
 func showHostWindow() {
@@ -179,14 +173,21 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 			return 0
 		}
 	case wmCommand:
-		switch wParam {
-		case idmShow:
+		// ★ 用 if 链而非 case 常量：id 冲突时仍能编译，由 TestTrayMenuIDsUnique 抓回归。
+		cmd := int(wParam)
+		switch {
+		case cmd == idmShow:
 			showHostWindow()
-		case idmStop:
+		case cmd == idmOpen:
+			openConfigPage()
+		case cmd == idmCopy:
+			// ★ 剪贴板 Open/Close 与本 wndProc 同 OS 线程（消息循环已 LockOSThread）。
+			copyConfigURL()
+		case cmd == idmStop:
 			if host.Stop != nil {
 				host.Stop()
 			}
-		case idmQuit:
+		case cmd == idmQuit:
 			delTrayIcon(hwnd)
 			if host.Quit != nil {
 				host.Quit()
@@ -211,6 +212,9 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 func showTrayMenu(hwnd windows.Handle) {
 	menu, _, _ := procCreatePopupMenu.Call()
 	appendMenu(menu, idmShow, "显示窗口")
+	appendMenu(menu, idmOpen, "直接打开配置页")
+	appendMenu(menu, idmCopy, "复制配置页地址")
+	appendSeparator(menu)
 	appendMenu(menu, idmStop, "停止")
 	appendMenu(menu, idmQuit, "退出")
 	procSetForegroundWindow.Call(uintptr(hwnd))
@@ -224,6 +228,10 @@ func appendMenu(menu uintptr, id int, text string) {
 	procAppendMenuW.Call(menu, 0, uintptr(id), uintptr(unsafe.Pointer(s)))
 }
 
+func appendSeparator(menu uintptr) {
+	procAppendMenuW.Call(menu, mfSeparator, 0, 0)
+}
+
 func addTrayIcon(hwnd windows.Handle) {
 	var nid notifyIconData
 	nid.cbSize = 504 // NOTIFYICONDATAW（64-bit）
@@ -231,7 +239,7 @@ func addTrayIcon(hwnd windows.Handle) {
 	nid.uID = 1
 	nid.uFlags = nifMsg | nifIcon | nifTip
 	nid.uCallbackMessage = wmTray
-	nid.hIcon = appIcon()
+	nid.hIcon = loadIcon(32512)
 	copy(nid.szTip[:], utf16("tunnel-agent"))
 	procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
 }
@@ -244,11 +252,8 @@ func delTrayIcon(hwnd windows.Handle) {
 	procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
 }
 
-// appIcon 优先加载随包分发的 tunnel-agent.ico；找不到则回退系统默认图标。
-//
-// ★ 原先固定用 loadIcon(32512)=IDI_APPLICATION（系统白板图标），
-//
-//	所以"换图标"这件事在 Windows 上从来没生效过。
+// loadAppIcon 尝试加载与可执行文件同目录（或 assets/）下的 tunnel-agent.ico。
+// ★ 找不到时返回 0，调用方回退到系统默认图标（保持零依赖、不 panic）。
 func appIcon() windows.Handle {
 	if h := loadAppIcon(); h != 0 {
 		return h
@@ -256,8 +261,6 @@ func appIcon() windows.Handle {
 	return loadIcon(32512) // IDI_APPLICATION
 }
 
-// loadAppIcon 从可执行文件同目录（或 assets/ 子目录）加载 tunnel-agent.ico。
-// 找不到时返回 0，由调用方回退 —— 保持零依赖、绝不 panic。
 func loadAppIcon() windows.Handle {
 	cands := []string{}
 	if exe, err := os.Executable(); err == nil {
@@ -279,7 +282,7 @@ func loadAppIcon() windows.Handle {
 		// LR_LOADFROMFILE(0x0010) | LR_DEFAULTSIZE(0x0040)
 		r, _, _ := procLoadImageW.Call(0, uintptr(unsafe.Pointer(p)), imageIcon, 0, 0, 0x0010|0x0040)
 		if r != 0 {
-			log.Printf("托盘图标：已加载 %s", c)
+			log.Printf("托盘图标：%s", c)
 			return windows.Handle(r)
 		}
 	}

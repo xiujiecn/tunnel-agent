@@ -115,7 +115,7 @@ jobs:
       # ★ 这一条是本仓库最实际的门禁：用户是把二进制**下载到别的机器上**跑的，
       #   所以"在 Ubuntu 上编出来的能不能在 Windows 上跑"是核心问题，
       #   而不是"能不能在本机跑起来"。
-      - name: 交叉编译
+      - name: 交叉编译并打包
         # ★ 这个 job 只在 ubuntu 上跑，但显式声明 bash 仍然是好习惯：
         #   将来有人把它加进三平台矩阵时不会突然踩 PowerShell 的坑。
         shell: bash
@@ -124,26 +124,39 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          DIST="$(pwd)/dist"
           # ★ macOS 已从这里移除：状态栏托盘是 cgo（Cocoa），
           #   CGO_ENABLED=0 时 darwin 的 gui 包缺 runTray/runHostWindow，
           #   构建会报 undefined —— 见下方 macos-app job。
+          #
+          # ★ 只出压缩包，不出裸二进制（与 release.yml 同一口径）：
+          #   裸文件没有扩展名，浏览器当未知类型、Gatekeeper 直接拦，
+          #   下载页也从不下发它。
           for target in \
             linux/amd64 linux/arm64 \
             windows/amd64 windows/arm64
           do
             os="${target%%/*}"
             arch="${target##*/}"
-            out="dist/tunnel-agent-${os}-${arch}"
-            [ "$os" = "windows" ] && out="${out}.exe"
+            work="$(mktemp -d)"
             echo "▶ $os/$arch"
-            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$out" .
-            ls -lh "$out"
+
+            if [ "$os" = "windows" ]; then
+              GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$work/tunnel-agent.exe" .
+              (cd "$work" && zip -q "$DIST/tunnel-agent-${os}-${arch}.zip" tunnel-agent.exe)
+            else
+              GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$work/tunnel-agent" .
+              chmod 755 "$work/tunnel-agent"
+              tar -czf "dist/tunnel-agent-${os}-${arch}.tar.gz" -C "$work" tunnel-agent
+            fi
+            rm -rf "$work"
           done
+          ls -lh dist/
 
       # ★ 与 release.yml 共用同一个校验脚本（不内联第二份）——
       #   CI 先拦住问题，就不必等发布流程才发现。
       - name: 校验产物架构
-        run: bash scripts/verify-artifacts.sh
+        run: bash scripts/verify-artifacts.sh dist unix
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -175,7 +188,7 @@ jobs:
           echo "== 单独编译 gui 包（cgo 隔离验证）=="
           CGO_ENABLED=1 go build -v ./gui/ 2>&1 | tail -50 || echo "gui 编译失败（见上）"
 
-      - name: 构建 macOS .app + 裸二进制
+      - name: 构建 macOS .app（CGO_ENABLED=1）
         shell: bash
         run: |
           set -euo pipefail
@@ -186,15 +199,17 @@ jobs:
           done
           ls -laR dist/
 
-      - name: 校验产物齐全
+      - name: 校验 macOS 产物
         shell: bash
         run: |
           set -euo pipefail
           ls -la dist/
+          # ★ 只有压缩包，没有裸文件 —— 与 release.yml 同一口径
           for a in arm64 amd64; do
-            test -f "dist/tunnel-agent-darwin-${a}" || { echo "::error::缺裸二进制 ${a}"; exit 1; }
-            test -f "dist/tunnel-agent-darwin-${a}.app.zip" || { echo "::error::缺 .app.zip ${a}"; exit 1; }
+            test -f "dist/tunnel-agent-darwin-${a}.tar.gz" || { echo "::error::缺 .tar.gz ${a}"; exit 1; }
           done
+          # 解开来看里面是不是真的 .app、二进制架构对不对
+          bash scripts/verify-artifacts.sh dist macos
           echo "✓ macOS 产物齐全"
 
       - uses: actions/upload-artifact@v4

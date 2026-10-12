@@ -21,6 +21,7 @@ func runTray(h TrayHost) {
 }
 
 func runHostWindow(h TrayHost, baseURL string) {
-	_ = h
-	_ = baseURL
+	host = h
+	hostURL = baseURL
+	log.Printf("配置页地址：%s（本平台无托盘菜单；请在浏览器打开）", baseURL)
 }
