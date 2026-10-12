@@ -210,7 +210,7 @@ jobs:
           | Windows (x64) | \`tunnel-agent-windows-amd64.exe\` |
           | Windows (ARM64) | \`tunnel-agent-windows-arm64.exe\` |
 
-          全部静态链接（\`CGO_ENABLED=0\`），下载后先加执行权限：
+          Linux / Windows 为纯静态（\`CGO_ENABLED=0\`），下载后先加执行权限：
 
           \`\`\`bash
           chmod +x tunnel-agent-*
