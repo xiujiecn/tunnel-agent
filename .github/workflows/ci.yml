@@ -27,7 +27,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod   # ★ 跟随 go.mod，避免版本漂移
           cache: true
 
       # ★ gofmt 与 vet 是「能不能被合并」的前置条件，不是建议。
@@ -71,7 +71,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod   # ★ 跟随 go.mod，避免版本漂移
           cache: true
 
       # ★ 这一条是本仓库最实际的门禁：用户是把二进制**下载到别的机器上**跑的，
@@ -89,8 +89,8 @@ jobs:
           # ★ macOS 已从这里移除：状态栏托盘是 cgo（Cocoa），
           #   CGO_ENABLED=0 时 darwin 的 gui 包缺 runTray/runHostWindow，
           #   构建会报 undefined —— 见下方 macos-app job。
-          for target in \\
-            linux/amd64 linux/arm64 \\
+          for target in \
+            linux/amd64 linux/arm64 \
             windows/amd64 windows/arm64
           do
             os="${target%%/*}"
@@ -124,7 +124,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod   # ★ 跟随 go.mod，避免版本漂移
           cache: true
 
       - name: 构建 macOS .app + 裸二进制

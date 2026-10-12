@@ -11,9 +11,9 @@ import (
 
 // Controller 管理 agent 运行与日志（GUI / 托盘共用）。
 type Controller struct {
-	mu     sync.Mutex
-	logs   *LogBuffer
-	cancel context.CancelFunc
+	mu      sync.Mutex
+	logs    *LogBuffer
+	cancel  context.CancelFunc
 	running bool
 	lastErr string
 }

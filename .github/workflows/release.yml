@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod   # ★ 跟随 go.mod，避免版本漂移
           cache: true
 
       - name: 定版本
@@ -72,8 +72,8 @@ jobs:
           mkdir -p dist
           # ★ macOS 已从这里移除：托盘走 cgo（Cocoa），必须在 mac runner 上编，
           #   见下方 build-macos job。CGO_ENABLED=0 编 darwin 会报 undefined。
-          for target in \\
-            linux/amd64 linux/arm64 \\
+          for target in \
+            linux/amd64 linux/arm64 \
             windows/amd64 windows/arm64
           do
             os="${target%%/*}"
@@ -121,7 +121,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod   # ★ 跟随 go.mod，避免版本漂移
           cache: true
 
       - name: 单元测试
@@ -221,9 +221,9 @@ jobs:
           ### 用法
 
           \`\`\`bash
-          tunnel-agent \\
-            -server wss://<你的服务端>/api/v1/tunnel/agent/attach \\
-            -token  <绑定票据> \\
+          tunnel-agent \
+            -server wss://<你的服务端>/api/v1/tunnel/agent/attach \
+            -token  <绑定票据> \
             -local  127.0.0.1:3000
           \`\`\`
 

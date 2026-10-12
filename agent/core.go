@@ -859,6 +859,7 @@ func (rt *agentRuntime) closeStream(streams map[string]net.Conn, streamMu *sync.
 //	所以策略是：回环放行（那就是本机的服务，正是目标）；
 //	私有网段**放行但明确警示**（它可能是合法的"同局域网另一台机器"）；
 //	其余（公网地址）**直接拒绝** —— 那一定不是用户想要的。
+//
 // CheckLocalAddr 校验 -local（CLI/GUI 共用）。
 func CheckLocalAddr(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
