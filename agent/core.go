@@ -607,8 +607,11 @@ func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBa
 	// ★ 软轮换：阈值（~40s）前 make-before-break。
 	var softArmed atomic.Bool
 	var handoff atomic.Pointer[websocket.Conn]
+	// handoffReady 在「轮换拨号有了结论」时关闭，好让读循环等它落位，而不是急着重连。
+	handoffReady := make(chan struct{})
 	if softRecycleAfter > 0 {
 		go func() {
+			defer close(handoffReady)
 			t := time.NewTimer(softRecycleAfter)
 			defer t.Stop()
 			select {
@@ -616,9 +619,17 @@ func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBa
 				return
 			case <-t.C:
 				rt.emitf("软轮换：本连接已满 %s（低于链路 ~40s 掐断），先建新再拆旧…\n", softRecycleAfter)
-				newConn, dialErr := rt.dialWS(ctx)
+				// ★★ 必须先置位、再拨号。
+				//   dialWS 的 WS 握手本身就是 attach ⇒ 它「成功返回」的那一刻，
+				//   服务端已经接管本隧道并主动关掉了旧连接。
+				//   若置位晚于 dialWS，旧连接被服务端关闭时 softArmed 还是 false，
+				//   读循环会把它当成真实断开（症状：偶发打「隧道已断开 … 1s 后重连」，
+				//   且这条重连立刻又把刚拨好的新连接顶掉 ⇒ 肉眼就是「35s 断一下」）。
 				softArmed.Store(true)
+				newConn, dialErr := rt.dialWS(ctx)
 				if dialErr != nil {
+					// 拨号失败＝这次不是轮换：恢复真实断开语义，交给外层立刻重连。
+					softArmed.Store(false)
 					rt.emitf("软轮换 Dial 失败：%v —— 拆旧后由外层立即重连\n", dialErr)
 					_ = conn.Close()
 					return
@@ -639,6 +650,12 @@ func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBa
 			}
 			streamMu.Unlock()
 			if softArmed.Load() {
+				// ★ 轮换已开始：新连接正在拨号中，等它落位再切过去。
+				//   绝不能在这里立刻返回 errSoftRecycle —— 那会再拨一条连接，
+				//   把正在拨号的那条顶掉（服务端 4012 replaced），轮换就退化成
+				//   「一直重连」的抖动。handoffReady 在拨号有结论时关闭：
+				//   成功 ⇒ handoff 有值、无缝切换；失败 ⇒ 外层按需重连。
+				<-handoffReady
 				if next := handoff.Load(); next != nil {
 					return next, nil
 				}
