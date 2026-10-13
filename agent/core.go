@@ -99,6 +99,15 @@ type Config struct {
 	Verbose   bool
 	// Proto 协议：http（默认）| tcp | udp。缺省必须保持旧行为。
 	Proto string
+	// SoftRecycleAfter 软轮换阈值：> 0 时在链路掐断前主动 make-before-break 换连接。
+	//
+	// ★ 默认 0 = 关闭，保持一条真正的长连接。
+	//   历史：某些链路（本机 Clash TUN 用 gvisor 用户态栈）会每 ~40s 掐长连接，
+	//   于是客户端在 35s 主动换连接来绕开它 —— 但那本身就是「周期性重连」，
+	//   用户看到的就是「每 35s 断一下」。正解是把链路修好
+	//   （Clash TUN stack 改 system），于是默认关闭；
+	//   只有改不了链路的机器才用 -recycle 显式打开。
+	SoftRecycleAfter time.Duration
 }
 
 // NormalizeProto 空 / 未知 → http（旧脚本不加 -proto 仍只跑 HTTP）。
@@ -129,13 +138,14 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 		}
 	}
 	rt := &agentRuntime{
-		serverURL:   cfg.ServerURL,
-		token:       cfg.Token,
-		localAddr:   cfg.LocalAddr,
-		proto:       cfg.Proto,
-		verbose:     cfg.Verbose,
-		localClient: NewLocalClient(),
-		out:         out,
+		serverURL:        cfg.ServerURL,
+		token:            cfg.Token,
+		localAddr:        cfg.LocalAddr,
+		proto:            cfg.Proto,
+		verbose:          cfg.Verbose,
+		softRecycleAfter: cfg.SoftRecycleAfter,
+		localClient:      NewLocalClient(),
+		out:              out,
 	}
 	return rt.run(ctx)
 }
@@ -179,7 +189,9 @@ type agentRuntime struct {
 	localAddr string
 	proto     string
 	verbose   bool
-	out       io.Writer
+	// softRecycleAfter 见 Config.SoftRecycleAfter：0 = 不轮换（默认），保持长连接。
+	softRecycleAfter time.Duration
+	out              io.Writer
 
 	// localClient 转发到本地服务用的 client，**整个进程复用**。
 	//
@@ -467,10 +479,6 @@ const (
 	agentReadIdleTimeout = 90 * time.Second
 	// 等 pong：须 > ping 间隔，避免偶发慢往返误杀；取 2.5×ping。
 	agentPongTimeout = 25 * time.Second
-	// softRecycleAfter：在链路 ~40s 掐断之前主动换连接。
-	// ★ 0 = 关闭软轮换（破坏性验证用：应复现 40s 断连）。
-	//   默认 35s：先 Dial 新连接（服务端接管）再拆旧 = make-before-break，空窗≈RTT。
-	softRecycleAfter = 35 * time.Second
 )
 
 // errSoftRecycle 软轮换：非故障，run 循环应立即接上（无退避）。
@@ -609,16 +617,16 @@ func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBa
 	var handoff atomic.Pointer[websocket.Conn]
 	// handoffReady 在「轮换拨号有了结论」时关闭，好让读循环等它落位，而不是急着重连。
 	handoffReady := make(chan struct{})
-	if softRecycleAfter > 0 {
+	if rt.softRecycleAfter > 0 {
 		go func() {
 			defer close(handoffReady)
-			t := time.NewTimer(softRecycleAfter)
+			t := time.NewTimer(rt.softRecycleAfter)
 			defer t.Stop()
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				rt.emitf("软轮换：本连接已满 %s（低于链路 ~40s 掐断），先建新再拆旧…\n", softRecycleAfter)
+				rt.emitf("软轮换：本连接已满 %s（-recycle 指定），先建新再拆旧…\n", rt.softRecycleAfter)
 				// ★★ 必须先置位、再拨号。
 				//   dialWS 的 WS 握手本身就是 attach ⇒ 它「成功返回」的那一刻，
 				//   服务端已经接管本隧道并主动关掉了旧连接。

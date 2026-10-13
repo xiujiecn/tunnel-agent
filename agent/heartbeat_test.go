@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -21,13 +23,21 @@ func TestAgentHeartbeatAlignedWithServerWindow(t *testing.T) {
 	}
 }
 
-// TestSoftRecycleBeforePathKill 软轮换必须早于实测链路掐断（~40s）。
-func TestSoftRecycleBeforePathKill(t *testing.T) {
-	if softRecycleAfter <= 0 {
-		t.Fatal("softRecycleAfter 必须开启（破坏性验证可临时改 0 复现 40s 断）")
+// TestSoftRecycleConfig 软轮换必须【默认关闭】。
+//
+// 历史：某些链路（本机 Clash TUN 用 gvisor 用户态栈）每 ~40s 掐长连接，
+// 于是客户端在 35s 主动 make-before-break 换连接绕开它。但轮换本身就是
+// 「周期性重连」，用户看到的是「每 35s 断一下」—— 那是权宜之计，不是长连接。
+// 正解是修链路（Clash TUN stack → system），所以默认值必须是 0（关闭）。
+// 仍保留 -recycle 供改不了链路的机器显式打开（届时阈值须 < 40s）。
+func TestSoftRecycleConfig(t *testing.T) {
+	// 默认值由 main.go 的 -recycle flag 决定，必须是 0。
+	src, err := os.ReadFile("../../main.go")
+	if err != nil {
+		t.Skipf("读不到 main.go：%v", err)
 	}
-	if softRecycleAfter >= 40*time.Second {
-		t.Fatalf("softRecycleAfter=%s 必须 < 40s（链路掐断实测阈值）", softRecycleAfter)
+	if !strings.Contains(string(src), `flag.Duration("recycle", 0,`) {
+		t.Fatal("-recycle 的默认值必须是 0（默认不轮换、保持长连接）")
 	}
 	if agentPingInterval >= 20*time.Second {
 		t.Fatalf("agentPingInterval=%s 必须明显密于旧 20s（否则又踩 2×ping=40s）", agentPingInterval)
