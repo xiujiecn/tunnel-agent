@@ -86,6 +86,7 @@ func newHTTPServer(ctrl *Controller, baseURL string) *http.Server {
 		Server  string `json:"server"`
 		Token   string `json:"token"`
 		Local   string `json:"local"`
+		Proto   string `json:"proto"`
 		Verbose bool   `json:"verbose"`
 		Paste   string `json:"paste"`
 	}
@@ -103,7 +104,7 @@ func newHTTPServer(ctrl *Controller, baseURL string) *http.Server {
 		if strings.TrimSpace(body.Paste) != "" {
 			err = ctrl.StartFromPaste(body.Paste)
 		} else {
-			err = ctrl.StartFromFields(body.Server, body.Token, body.Local, body.Verbose)
+			err = ctrl.StartFromFields(body.Server, body.Token, body.Local, body.Proto, body.Verbose)
 		}
 		if err != nil {
 			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
@@ -130,7 +131,8 @@ func newHTTPServer(ctrl *Controller, baseURL string) *http.Server {
 			return
 		}
 		writeJSON(w, map[string]any{
-			"ok": true, "server": p.ServerURL, "token": p.Token, "local": p.LocalAddr, "verbose": p.Verbose,
+			"ok": true, "server": p.ServerURL, "token": p.Token, "local": p.LocalAddr,
+			"proto": p.Proto, "verbose": p.Verbose,
 		})
 	})
 

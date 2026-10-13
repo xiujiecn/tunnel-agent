@@ -36,8 +36,8 @@ func (c *Controller) LastError() string {
 	return c.lastErr
 }
 
-func (c *Controller) StartFromFields(server, token, local string, verbose bool) error {
-	p, err := lib.ParseFields(server, token, local, verbose)
+func (c *Controller) StartFromFields(server, token, local, proto string, verbose bool) error {
+	p, err := lib.ParseFields(server, token, local, proto, verbose)
 	if err != nil {
 		return err
 	}
@@ -45,6 +45,7 @@ func (c *Controller) StartFromFields(server, token, local string, verbose bool) 
 		ServerURL: p.ServerURL,
 		Token:     p.Token,
 		LocalAddr: p.LocalAddr,
+		Proto:     p.Proto,
 		Verbose:   p.Verbose,
 	})
 }
@@ -58,6 +59,7 @@ func (c *Controller) StartFromPaste(line string) error {
 		ServerURL: p.ServerURL,
 		Token:     p.Token,
 		LocalAddr: p.LocalAddr,
+		Proto:     p.Proto,
 		Verbose:   p.Verbose,
 	})
 }
