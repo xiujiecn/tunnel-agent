@@ -124,9 +124,17 @@ func NormalizeProto(p string) string {
 // Run 启动隧道转发，阻塞直到 ctx 结束或不可恢复错误。
 // out 为 nil 时写到 os.Stdout；GUI 可传入带 SSE 的 Writer。
 func Run(ctx context.Context, cfg Config, out io.Writer) error {
+	// ★ 只有真正没给 -local（空串）才用默认值；显式纯空白必须报错，不许静默换成 127.0.0.1:3000。
 	if cfg.LocalAddr == "" {
 		cfg.LocalAddr = "127.0.0.1:3000"
+	} else if strings.TrimSpace(cfg.LocalAddr) == "" {
+		return fmt.Errorf("本地地址不合法：%w", ErrLocalAddrWhitespace)
 	}
+	normalized, err := NormalizeLocalAddrInput(cfg.LocalAddr)
+	if err != nil {
+		return fmt.Errorf("本地地址不合法：%w", err)
+	}
+	cfg.LocalAddr = normalized
 	cfg.Proto = NormalizeProto(cfg.Proto)
 	if err := CheckLocalAddr(cfg.LocalAddr); err != nil {
 		var warning *warningError
@@ -136,6 +144,14 @@ func Run(ctx context.Context, cfg Config, out io.Writer) error {
 		} else {
 			return fmt.Errorf("本地地址不合法：%w", err)
 		}
+	}
+	// ★ fail-fast：启动时就解析基址，绝不能把 nil 活到第一条请求再 SIGSEGV。
+	base, err := ParseLocalBaseURL(cfg.LocalAddr)
+	if err != nil {
+		return fmt.Errorf("本地地址不合法（-local %q）：%w", cfg.LocalAddr, err)
+	}
+	if base.Scheme == "https" && !isLoopbackHost(base.Hostname()) {
+		log.Printf("本地一跳不校验 TLS 证书（本地服务常是自签）；目标在局域网，请自行确认那台机器可信")
 	}
 	rt := &agentRuntime{
 		serverURL:        cfg.ServerURL,
@@ -169,8 +185,11 @@ func usage(w io.Writer) {
   -server   服务端 agent 接入地址（必填）
   -token    绑定票据（必填；换发后旧票失效）
   -local    本地服务地址，默认 127.0.0.1:3000
+            可写 host:port（默认 http）或显式 http(s)://host:port
   -proto    协议：http（默认）| tcp | udp；必须与隧道创建时一致
   -v        打印每条请求的转发明细
+  -version  打印版本与编译时间后退出
+  -gui      打开图形控制台
 
 说明：
   · 本工具会把你指定的本地服务**临时暴露到公网**，
@@ -179,6 +198,9 @@ func usage(w io.Writer) {
   · 本地地址只允许回环或私有网段（见启动时的检查）——
     它不是安全边界，而是一道防手滑的闸：把 -local 写成某个内网 IP
     会让你的 agent 变成访问那台机器的跳板。
+  · -local 支持 https://host:port（自签可用）；不带 scheme 默认 http。
+    ★ 本地一跳不校验证书；agent↔服务端的 wss 仍严格校验。
+  · 本命令行模式【一个进程只支持一条隧道】；要同时跑多条，请用图形控制台（双击或 -gui），或为每条隧道各起一个进程。
 `)
 }
 
@@ -202,6 +224,12 @@ type agentRuntime struct {
 	// ★ 它不能是 http.DefaultClient：后者没有连接池参数（新建即丢），
 	//   且代理策略不可控。理由详见 newLocalClient 的注释。
 	localClient *http.Client
+
+	// pendingBodies 在途请求的请求体表（每条隧道 / 每个 runtime 自持）。
+	//
+	// ★ 曾是包级全局 sync.Map：单实例服务端 stream ID 全局唯一时不会串包，
+	//   但图形控制台同进程多隧道后必须下沉，避免跨隧道共享可变状态。
+	pendingBodies sync.Map // requestID → *pendingBody
 }
 
 func (rt *agentRuntime) emitf(format string, args ...any) {
@@ -362,7 +390,11 @@ func (rt *agentRuntime) connectOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	localBase, _ := rt.localBaseURL()
+	localBase, err := rt.localBaseURL()
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("本地地址不合法（-local %q）：%w", rt.localAddr, err)
+	}
 	rt.emitf("已连接：本地 %s  <-->  %s\n", rt.localAddr, rt.serverURL)
 
 	for {
@@ -456,18 +488,7 @@ func attachURL(serverURL, token, proto string) (string, error) {
 
 // localBaseURL 本地服务的基地址（带 scheme）。
 func (rt *agentRuntime) localBaseURL() (*url.URL, error) {
-	host := rt.localAddr
-	if !strings.Contains(host, "://") {
-		host = "http://" + host
-	}
-	u, err := url.Parse(host)
-	if err != nil {
-		return nil, err
-	}
-	if u.Host == "" {
-		return nil, errors.New("本地地址缺少主机名")
-	}
-	return u, nil
+	return ParseLocalBaseURL(rt.localAddr)
 }
 
 // 心跳 / 软轮换参数（与服务端 logic/tunnel/heartbeat.go 对齐）。
@@ -490,6 +511,9 @@ var errSoftRecycle = errors.New("soft recycle: 主动换连接以避开链路空
 //	返回 (nil, errSoftRecycle)：已拆旧但 Dial 新连接失败，外层立即重连；
 //	返回 (nil, other)：真断开。
 func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBase *url.URL) (*websocket.Conn, error) {
+	// 连接结束时清掉在途 body，避免 pipe/写协程泄漏到下一把连接。
+	defer rt.clearPendingBodies()
+
 	//写锁：多个在途请求会并发往这条连接写响应帧，而 gorilla 不允许并发写。
 	var writeMu sync.Mutex
 	// 透传流表（WebSocket 透传）：streamId → 它的本地 TCP 连接。
@@ -690,7 +714,7 @@ func (rt *agentRuntime) serve(ctx context.Context, conn *websocket.Conn, localBa
 			var pb *pendingBody
 			if f.ID != "" {
 				pb = newPendingBody()
-				pendingBodies.Store(f.ID, pb)
+				rt.pendingBodies.Store(f.ID, pb)
 			}
 			go rt.handleRequest(conn, &writeMu, localBase, f, pb)
 		case frameRequestBody:
@@ -767,12 +791,9 @@ func (pb *pendingBody) closeChunks() {
 	pb.once.Do(func() { close(pb.chunks) })
 }
 
-// pendingBodies 在途请求的请求体表。
-var pendingBodies sync.Map // requestID → *pendingBody
-
 // pushRequestBody 把一个请求体数据块交给写协程（读循环不阻塞在 pipe 上）。
 func (rt *agentRuntime) pushRequestBody(f frame) {
-	v, ok := pendingBodies.Load(f.ID)
+	v, ok := rt.pendingBodies.Load(f.ID)
 	if !ok {
 		return
 	}
@@ -795,7 +816,7 @@ func (rt *agentRuntime) pushRequestBody(f frame) {
 
 // closeRequestBody 结束某个请求的请求体（发EOF 给本地服务）。
 func (rt *agentRuntime) closeRequestBody(id string) {
-	if v, ok := pendingBodies.LoadAndDelete(id); ok {
+	if v, ok := rt.pendingBodies.LoadAndDelete(id); ok {
 		v.(*pendingBody).closeChunks()
 	}
 }
@@ -809,7 +830,7 @@ func (rt *agentRuntime) abandonRequestBody(id string) {
 	if id == "" {
 		return
 	}
-	if v, ok := pendingBodies.LoadAndDelete(id); ok {
+	if v, ok := rt.pendingBodies.LoadAndDelete(id); ok {
 		pb := v.(*pendingBody)
 		// 先打断可能卡在 Write 上的 pump，再关 channel。
 		_ = pb.writer.CloseWithError(io.ErrClosedPipe)
@@ -817,17 +838,28 @@ func (rt *agentRuntime) abandonRequestBody(id string) {
 	}
 }
 
+// clearPendingBodies 连接断开时清理全部在途 body（避免泄漏到下一把连接）。
+func (rt *agentRuntime) clearPendingBodies() {
+	rt.pendingBodies.Range(func(key, value any) bool {
+		pb := value.(*pendingBody)
+		_ = pb.writer.CloseWithError(io.ErrClosedPipe)
+		pb.closeChunks()
+		rt.pendingBodies.Delete(key)
+		return true
+	})
+}
+
 // handleRequest 处理一次本地 HTTP 请求。
 // body 参数是**调用方已登记好**的请求体中转缓冲（可能是 nil，表示无 body）。
 //
 // ★★ 为什么要由调用方建好再传进来（本项目真实踩过的竞态）：
 //
-//	原来是在本函数里 `pendingBodies.Store(...)`，而调用方是
+//	原来是在本函数里 `rt.pendingBodies.Store(...)`，而调用方是
 //	`go rt.handleRequest(...)` —— **新协程什么时候真正开始跑是不确定的**，
 //	而服务端发来的 `reqBody` 帧是在**当前读循环里紧接着处理的**。
 //	于是出现这条时序：
 //	    读循环收到 request 帧 → 启动 goroutine → 继续读
-//	    读循环收到 reqBody 帧 → 查pendingBodies → **还没登记** → 静默丢弃
+//	    读循环收到 reqBody 帧 → 查 rt.pendingBodies → **还没登记** → 静默丢弃
 //	    goroutine 终于开跑 → 登记 pipe（但数据已经丢了）
 //	⇒ 症状是「GET 正常、POST/PUT 永远收不到 body」，
 //	  而 agent 日志里只印一行"→ POST /xxx"，看起来一切正常。
@@ -837,6 +869,15 @@ func (rt *agentRuntime) abandonRequestBody(id string) {
 //	⇒ 把"建pipe + 登记"提到**启动 goroutine 之前**（同步完成），
 //	读循环后续处理 reqBody 时就一定查得到。
 func (rt *agentRuntime) handleRequest(conn *websocket.Conn, writeMu *sync.Mutex, localBase *url.URL, f frame, pb *pendingBody) {
+	// ★ 兜底：将来任何路径再把 nil 传进来，只能是「一条请求失败」，不能整进程 SIGSEGV。
+	if localBase == nil {
+		rt.abandonRequestBody(f.ID)
+		rt.emitln("内部错误：本地基址未初始化（localBase=nil），已拒绝本条请求")
+		if conn != nil && writeMu != nil {
+			rt.sendError(conn, writeMu, f.ID, "本地基址未初始化")
+		}
+		return
+	}
 	// ---- 构造本地请求 ----
 	target := *localBase
 	target.Path = singleJoiningSlash(localBase.Path, f.Path)
@@ -985,14 +1026,22 @@ func (rt *agentRuntime) openStream(conn *websocket.Conn, writeMu *sync.Mutex, st
 		rt.openRawStream(conn, writeMu, streamMu, streams, f)
 		return
 	}
+	if localBase == nil {
+		rt.emitln("内部错误：本地基址未初始化（localBase=nil），已拒绝 streamOpen")
+		if conn != nil && writeMu != nil {
+			writeMu.Lock()
+			_ = conn.WriteMessage(websocket.TextMessage, mustJSON(frame{
+				Type: frameError, StreamID: f.StreamID, Message: "本地基址未初始化",
+			}))
+			writeMu.Unlock()
+		}
+		return
+	}
 	rt.emitf("streamOpen id=%s proto=http-ws（帧proto=%q agent=-proto %s）\n",
 		f.StreamID, f.Proto, NormalizeProto(rt.proto))
-	host := localBase.Host
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		// 没有端口时补本地服务的默认端口假设（http 80）。
-		host = net.JoinHostPort(host, "80")
-	}
-	local, err := net.DialTimeout("tcp", host, 10*time.Second)
+	// ★ https 目标必须 tls.Dial：明文 HTTP 写到 TLS 端口 ⇒ Upgrade 全挂（本轮 P1）。
+	//   InsecureSkipVerify 只允许这一跳；服务端 wss（dialWS）仍严格校验。
+	local, err := dialLocalHTTPStream(localBase)
 	if err != nil {
 		writeMu.Lock()
 		_ = conn.WriteMessage(websocket.TextMessage, mustJSON(frame{
@@ -1027,6 +1076,27 @@ func (rt *agentRuntime) openStream(conn *websocket.Conn, writeMu *sync.Mutex, st
 	rt.pumpLocalToServer(conn, writeMu, streamMu, streams, local, f.StreamID)
 }
 
+// dialLocalHTTPStream 为 HTTP-WS Upgrade 建到本地服务的连接。
+//
+// ★ https → tls.Dial（默认端口 443，InsecureSkipVerify 仅此跳）；
+//
+//	http → 普通 TCP（默认端口 80）。
+func dialLocalHTTPStream(localBase *url.URL) (net.Conn, error) {
+	if localBase == nil {
+		return nil, errors.New("本地基址未初始化")
+	}
+	addr := dialHostPort(localBase)
+	d := &net.Dialer{Timeout: 10 * time.Second}
+	if localBase.Scheme == "https" {
+		return tls.DialWithDialer(d, "tcp", addr, &tls.Config{
+			InsecureSkipVerify: true, // 仅本地一跳；见 NewLocalClient 同口径
+			MinVersion:         tls.VersionTLS12,
+			ServerName:         localBase.Hostname(),
+		})
+	}
+	return d.Dial("tcp", addr)
+}
+
 // effectiveStreamProto 帧 proto 优先；空则用 agent -proto（Normalize 后）。
 func effectiveStreamProto(frameProto, agentProto string) string {
 	p := strings.TrimSpace(strings.ToLower(frameProto))
@@ -1043,7 +1113,9 @@ func effectiveStreamProto(frameProto, agentProto string) string {
 func (rt *agentRuntime) openRawStream(conn *websocket.Conn, writeMu *sync.Mutex, streamMu *sync.Mutex, streams map[string]net.Conn, f frame) {
 	dialAddr := strings.TrimSpace(f.Local)
 	if dialAddr == "" {
-		dialAddr = rt.localAddr
+		dialAddr = hostPortForDial(rt.localAddr)
+	} else {
+		dialAddr = hostPortForDial(dialAddr)
 	}
 	okFalse := false
 	okTrue := true
@@ -1152,30 +1224,21 @@ func (rt *agentRuntime) closeStream(streams map[string]net.Conn, streamMu *sync.
 //	其余（公网地址）**直接拒绝** —— 那一定不是用户想要的。
 //
 // CheckLocalAddr 校验 -local（CLI/GUI 共用）。
+//
+// ★ 与 ParseLocalBaseURL 共用最终 URL 解析结果：用 u.Hostname() 判回环/私网/公网，
+//
+//	拒绝 userinfo（防 `127.0.0.1:3000@8.8.8.8` 绕过），拒绝 path/query/fragment。
 func CheckLocalAddr(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
+	// ★ 先对原文扫空白（含尾随）：与「启动放行、运行期崩」口径对齐；
+	//   Normalize/Run 会先 TrimSpace，再进这里时已是干净串。
+	if containsWhitespaceOrControl(addr) {
+		return ErrLocalAddrWhitespace
+	}
+	u, err := ParseLocalBaseURL(addr)
 	if err != nil {
-		// 没写端口时按缺省处理：报错信息用 addr 原文，
-		// 让提示落在"你少了端口"而不是"格式错"上。
-		host = strings.TrimSpace(addr)
+		return err
 	}
-	if host == "" {
-		return errors.New("缺少主机名（例：127.0.0.1:3000）")
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		if host != "localhost" {
-			return fmt.Errorf("不支持主机名 %q：请用 IP 或 localhost（用域名会把 DNS 解析也变成一条不确定的链路）", host)
-		}
-		return warnPrivate("localhost（回环）")
-	}
-	if ip.IsLoopback() {
-		return nil
-	}
-	if ip.IsPrivate() || ip.IsLinkLocalUnicast() {
-		return warnPrivate(host)
-	}
-	return fmt.Errorf("拒绝连接公网地址 %s：-local 只允许本机或内网地址", host)
+	return checkHostnameAllowed(u.Hostname())
 }
 
 // warnPrivate 返回一个"放行但要提醒"的错误（调用方据此打警示而不退出）。

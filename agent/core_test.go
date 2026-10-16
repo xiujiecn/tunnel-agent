@@ -71,8 +71,8 @@ func TestRequestBodyRegisteredBeforeGoroutine(t *testing.T) {
 		t.Fatal("找不到 go rt.handleRequest")
 	}
 	beforeGo := branch[:goIdx]
-	if !strings.Contains(beforeGo, "pendingBodies.Store(") {
-		t.Fatal("pendingBodies.Store 必须在 go handleRequest 之前")
+	if !strings.Contains(beforeGo, "rt.pendingBodies.Store(") {
+		t.Fatal("rt.pendingBodies.Store 必须在 go handleRequest 之前")
 	}
 	if !strings.Contains(content, `req.Header.Del("Content-Length")`) {
 		t.Fatal("handleRequest 必须剔 Content-Length，否则本地服务会按访客长度干等")

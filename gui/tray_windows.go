@@ -215,7 +215,7 @@ func showTrayMenu(hwnd windows.Handle) {
 	appendMenu(menu, idmOpen, "直接打开配置页")
 	appendMenu(menu, idmCopy, "复制配置页地址")
 	appendSeparator(menu)
-	appendMenu(menu, idmStop, "停止")
+	appendMenu(menu, idmStop, "停止全部")
 	appendMenu(menu, idmQuit, "退出")
 	procSetForegroundWindow.Call(uintptr(hwnd))
 	var p point

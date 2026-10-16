@@ -104,7 +104,7 @@ void xj_install_async(const char *tooltip, const unsigned char *pngBytes,
             [menu addItem:miShow];
             [miShow release];
 
-            NSMenuItem *miStop = [[NSMenuItem alloc] initWithTitle:@"停止隧道"
+            NSMenuItem *miStop = [[NSMenuItem alloc] initWithTitle:@"停止全部"
                                                            action:@selector(onStop:)
                                                     keyEquivalent:@""];
             [miStop setTarget:gTarget];

@@ -30,7 +30,7 @@ func Run() error {
 		}
 	}()
 
-	ctrl.logs.Append("图形控制台已就绪：" + baseURL)
+	ctrl.Logs().Append("图形控制台已就绪：" + baseURL)
 	fmt.Fprintf(os.Stderr, "tunnel-agent 图形控制台：%s\n", baseURL)
 	fmt.Fprintf(os.Stderr, "（无桌面环境时可在本机浏览器打开上述地址）\n")
 
@@ -44,7 +44,7 @@ func Run() error {
 	var quitOnce sync.Once
 	doQuit := func() {
 		quitOnce.Do(func() {
-			ctrl.Stop()
+			ctrl.StopAll()
 			_ = srv.Shutdown(context.Background())
 			close(quit)
 		})
@@ -52,9 +52,9 @@ func Run() error {
 
 	host := TrayHost{
 		Show:   func() { showUI() },
-		Stop:   func() { ctrl.Stop() },
+		Stop:   func() { ctrl.StopAll() }, // 托盘「停止全部」
 		Quit:   doQuit,
-		Notify: func(msg string) { ctrl.logs.Append(msg) },
+		Notify: func(msg string) { ctrl.Logs().Append(msg) },
 	}
 
 	runHostWindow(host, baseURL)
