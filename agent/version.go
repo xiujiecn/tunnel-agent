@@ -11,7 +11,7 @@ import (
 // ★ 服务端用它区分日志与兼容策略；改行为时请 bump 次版本号。
 //
 //	保持 const，避免与服务端兼容策略的取值口径因 ldflags 漂移。
-const Version = "1.2.1"
+const Version = "1.2.2"
 
 // BuildTime 编译时间（由 -ldflags -X 注入；未注入时为 "unknown"）。
 //

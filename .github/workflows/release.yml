@@ -88,8 +88,11 @@ jobs:
 
             if [ "$os" = "windows" ]; then
               GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$work/tunnel-agent.exe" .
+              # ★ 托盘图标必须随包：Windows 托盘用 LoadImageW(LR_LOADFROMFILE) 读 exe 同目录的
+              #   tunnel-agent.ico；缺了就只有系统默认空白图标（现场缺陷 v0.3.7）。
+              cp gui/assets/tunnel-agent.ico "$work/tunnel-agent.ico"
               # ★ 用绝对路径：子 shell 里 $OLDPWD 依赖 cd 的行为，不可靠
-              (cd "$work" && zip -q "$DIST/tunnel-agent-${os}-${arch}.zip" tunnel-agent.exe)
+              (cd "$work" && zip -q "$DIST/tunnel-agent-${os}-${arch}.zip" tunnel-agent.exe tunnel-agent.ico)
             else
               GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$work/tunnel-agent" .
               chmod 755 "$work/tunnel-agent"
