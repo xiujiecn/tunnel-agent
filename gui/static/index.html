@@ -104,6 +104,7 @@
     </div>
   </div>
 
+  <p class="footer-banner" id="footerBanner">版本未知</p>
   <script>
     const logEl = document.getElementById('log');
     const listEl = document.getElementById('tunnelList');
@@ -278,6 +279,7 @@
         if (ver) {
           badge.textContent = 'v' + ver;
           badge.title = '构建于 ' + bt;
+          if (foot) foot.textContent = banner || ('tunnel-agent ' + ver);
         } else {
           badge.textContent = '版本未知';
           badge.title = '构建时间未知';
@@ -286,7 +288,7 @@
       } catch (_) {
         badge.textContent = '版本未知';
         badge.title = '构建时间未知';
-        foot.textContent = '版本未知';
+        if (foot) foot.textContent = '版本未知';
       }
     }
 
@@ -294,6 +296,5 @@
     refreshList();
     setInterval(refreshList, 2000);
   </script>
-  <p class="footer-banner" id="footerBanner">版本未知</p>
 </body>
 </html>

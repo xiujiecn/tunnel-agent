@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -226,5 +227,29 @@ func TestAPIStatusExposesVersion(t *testing.T) {
 	}
 	if banner != agent.BannerLine() {
 		t.Fatalf("banner=%q，期望 %q", banner, agent.BannerLine())
+	}
+}
+
+// TestConsoleFooterBeforeVersionScript 回归护栏（v0.3.6 现场缺陷）：
+// 控制台把 <p id="footerBanner"> 写在 </script> 之后时，loadVersion() 执行到
+// foot.textContent 会抛空引用 ⇒ 被 catch 兜回「版本未知」⇒ 版本号永远不显示。
+// 判据：页脚元素必须出现在 <script> 之前。
+func TestConsoleFooterBeforeVersionScript(t *testing.T) {
+	raw, err := os.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatalf("读 static/index.html 失败: %v", err)
+	}
+	s := string(raw)
+	foot := strings.Index(s, `id="footerBanner"`)
+	script := strings.Index(s, "<script>")
+	if foot < 0 || script < 0 {
+		t.Fatalf("找不到 footerBanner(%d) 或 <script>(%d)", foot, script)
+	}
+	if foot > script {
+		t.Fatalf("footerBanner 出现在 <script> 之后（foot=%d script=%d）：loadVersion() 会因 foot 为 null 抛错，版本号显示为「版本未知」", foot, script)
+	}
+	// 守卫语句必须在，避免以后 DOM 顺序再变又把版本号吞掉
+	if !strings.Contains(s, "if (foot) foot.textContent") {
+		t.Fatalf("缺少 foot 空值守卫：应写成 `if (foot) foot.textContent = ...`")
 	}
 }
