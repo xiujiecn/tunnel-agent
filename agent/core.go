@@ -248,6 +248,18 @@ func (rt *agentRuntime) emitln(args ...any) {
 	_, _ = fmt.Fprintln(w, args...)
 }
 
+// 本地拨号 / TLS 握手超时（var 便于单测缩短）。
+//
+// ★ 这两段超时只约束「本机/内网一跳」，失败只影响**这一条请求**：
+//
+//	必须在独立 goroutine 里拨号（handleRequest / openStream 已如此），
+//	超时后回 error / streamOpenResult，**绝不能**让整条隧道重连。
+//	现场 P1：路由器 https 管理页 TLS 握手不回 → 卡满超时 → 旧实现误杀 WS。
+var (
+	localDialTimeout         = 10 * time.Second
+	localTLSHandshakeTimeout = 10 * time.Second
+)
+
 // NewLocalClient 造一个"只连本地、绝不走代理"的 client。
 func NewLocalClient() *http.Client {
 	return &http.Client{
@@ -271,13 +283,13 @@ func NewLocalClient() *http.Client {
 			//	⇒ 本地转发一律不走代理，理由是"目标是内网，不该被第三方代转"。
 			Proxy: nil,
 			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
+				Timeout:   localDialTimeout,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 			MaxIdleConns:          32,
 			MaxIdleConnsPerHost:   8,
 			IdleConnTimeout:       60 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
+			TLSHandshakeTimeout:   localTLSHandshakeTimeout,
 			ExpectContinueTimeout: 1 * time.Second,
 			// 本地服务常是自签名 / 私有 CA 的开发服务（Vite dev、Spring Boot debug 等），
 			// 这里放宽证书校验是合理的 ——
@@ -289,7 +301,7 @@ func NewLocalClient() *http.Client {
 		},
 		// ★ 不设 Timeout：本地服务可能是 SSE / 长轮询这类长连接，
 		//   设了整体超时会把它们在固定时间后砍断。超时由服务端那一侧的
-		//   headTimeout / 空闲判定负责。
+		//   headWaitTimeout / 空闲判定负责。
 	}
 }
 
@@ -924,11 +936,13 @@ func (rt *agentRuntime) handleRequest(conn *websocket.Conn, writeMu *sync.Mutex,
 		log.Printf("→ %s %s?%s", f.Method, f.Path, f.Query)
 	}
 
-	// ★ 用runtime 上那个复用 client（不走代理的理由见 newLocalClient 的注释）。
+	// ★ 用 runtime 上那个复用 client（不走代理的理由见 NewLocalClient 的注释）。
+	//   Do 在本 goroutine 内阻塞（读循环早已 go 出去）—— 本地 TLS 卡死
+	//   只拖这一条请求，不会堵住 WS 读循环，更不会触发整条隧道重连。
 	resp, err := rt.localClient.Do(req)
 	if err != nil {
 		rt.abandonRequestBody(f.ID)
-		rt.sendError(conn, writeMu, f.ID, fmt.Sprintf("本地服务无响应：%v", err))
+		rt.sendError(conn, writeMu, f.ID, formatLocalDialErr(target.Host, err))
 		return
 	}
 	defer resp.Body.Close()
@@ -1041,11 +1055,12 @@ func (rt *agentRuntime) openStream(conn *websocket.Conn, writeMu *sync.Mutex, st
 		f.StreamID, f.Proto, NormalizeProto(rt.proto))
 	// ★ https 目标必须 tls.Dial：明文 HTTP 写到 TLS 端口 ⇒ Upgrade 全挂（本轮 P1）。
 	//   InsecureSkipVerify 只允许这一跳；服务端 wss（dialWS）仍严格校验。
+	//   dial 带独立握手超时；失败只回本流错误帧，不拆 WS。
 	local, err := dialLocalHTTPStream(localBase)
 	if err != nil {
 		writeMu.Lock()
 		_ = conn.WriteMessage(websocket.TextMessage, mustJSON(frame{
-			Type: frameError, StreamID: f.StreamID, Message: fmt.Sprintf("连不上本地服务：%v", err),
+			Type: frameError, StreamID: f.StreamID, Message: formatLocalDialErr(dialHostPort(localBase), err),
 		}))
 		writeMu.Unlock()
 		return
@@ -1078,23 +1093,78 @@ func (rt *agentRuntime) openStream(conn *websocket.Conn, writeMu *sync.Mutex, st
 
 // dialLocalHTTPStream 为 HTTP-WS Upgrade 建到本地服务的连接。
 //
-// ★ https → tls.Dial（默认端口 443，InsecureSkipVerify 仅此跳）；
+// ★ https → TCP dial + 有界 TLS Handshake（默认端口 443，InsecureSkipVerify 仅此跳）；
 //
 //	http → 普通 TCP（默认端口 80）。
+//
+// ★ 不能用 tls.DialWithDialer：Dialer.Timeout 只覆盖 TCP，握手阶段无截止时间 ——
+//
+//	路由器管理页这类「能 SYN、TLS 永不回」会把 openStream goroutine 永久挂死。
 func dialLocalHTTPStream(localBase *url.URL) (net.Conn, error) {
 	if localBase == nil {
 		return nil, errors.New("本地基址未初始化")
 	}
 	addr := dialHostPort(localBase)
-	d := &net.Dialer{Timeout: 10 * time.Second}
-	if localBase.Scheme == "https" {
-		return tls.DialWithDialer(d, "tcp", addr, &tls.Config{
-			InsecureSkipVerify: true, // 仅本地一跳；见 NewLocalClient 同口径
-			MinVersion:         tls.VersionTLS12,
-			ServerName:         localBase.Hostname(),
-		})
+	d := &net.Dialer{Timeout: localDialTimeout}
+	raw, err := d.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
 	}
-	return d.Dial("tcp", addr)
+	if localBase.Scheme != "https" {
+		return raw, nil
+	}
+	_ = raw.SetDeadline(time.Now().Add(localTLSHandshakeTimeout))
+	tlsConn := tls.Client(raw, &tls.Config{
+		InsecureSkipVerify: true, // 仅本地一跳；见 NewLocalClient 同口径
+		MinVersion:         tls.VersionTLS12,
+		ServerName:         localBase.Hostname(),
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		_ = raw.Close()
+		if isTimeoutErr(err) {
+			return nil, fmt.Errorf("local TLS handshake timeout: %s", addr)
+		}
+		return nil, fmt.Errorf("local TLS handshake failed: %s: %w", addr, err)
+	}
+	_ = raw.SetDeadline(time.Time{}) // 清截止时间，交给后续 Upgrade 读写
+	return tlsConn, nil
+}
+
+// formatLocalDialErr 把本地拨号/握手错误收成可读短句（写入 error 帧给服务端/访客）。
+func formatLocalDialErr(hostPort string, err error) string {
+	if err == nil {
+		return "本地服务无响应"
+	}
+	msg := err.Error()
+	// 已是规范文案（dialLocalHTTPStream 直接返回）则原样用。
+	if strings.HasPrefix(msg, "local TLS handshake timeout:") ||
+		strings.HasPrefix(msg, "local TLS handshake failed:") {
+		return msg
+	}
+	if isTimeoutErr(err) || strings.Contains(msg, "TLS handshake timeout") {
+		if hostPort == "" {
+			return "local TLS handshake timeout"
+		}
+		return "local TLS handshake timeout: " + hostPort
+	}
+	if hostPort != "" {
+		return fmt.Sprintf("本地服务无响应（%s）：%v", hostPort, err)
+	}
+	return fmt.Sprintf("本地服务无响应：%v", err)
+}
+
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "tls handshake timeout")
 }
 
 // effectiveStreamProto 帧 proto 优先；空则用 agent -proto（Normalize 后）。
@@ -1130,7 +1200,8 @@ func (rt *agentRuntime) openRawStream(conn *websocket.Conn, writeMu *sync.Mutex,
 		_ = conn.WriteMessage(websocket.TextMessage, mustJSON(fr))
 	}
 	rt.emitf("dial 本地 %s（stream=%s）…\n", dialAddr, f.StreamID)
-	local, err := net.DialTimeout("tcp", dialAddr, 10*time.Second)
+	// ★ 有界 dial；失败只回 streamOpenResult，不拆隧道 WS。
+	local, err := net.DialTimeout("tcp", dialAddr, localDialTimeout)
 	if err != nil {
 		rt.emitf("dial 本地失败 stream=%s addr=%s：%v\n", f.StreamID, dialAddr, err)
 		sendResult(false, fmt.Sprintf("本地拒绝连接：%v", err))

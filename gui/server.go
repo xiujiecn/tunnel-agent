@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xiujiecn/tunnel-agent/agent"
 	"github.com/xiujiecn/tunnel-agent/lib"
 )
 
@@ -22,12 +23,15 @@ func newHTTPServer(ctrl *Controller, baseURL string) *http.Server {
 	sub, _ := fs.Sub(staticFS, "static")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
-	// 汇总：托盘/脚本可能仍读 /api/status
+	// 汇总：托盘/脚本可能仍读 /api/status（新增 version/buildTime/banner，旧字段保持）
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
-			"running": ctrl.Running(),
-			"count":   ctrl.RunningCount(),
-			"error":   ctrl.LastError(),
+			"running":   ctrl.Running(),
+			"count":     ctrl.RunningCount(),
+			"error":     ctrl.LastError(),
+			"version":   agent.Version,
+			"buildTime": agent.BuildTime,
+			"banner":    agent.BannerLine(),
 		})
 	})
 
@@ -35,6 +39,7 @@ func newHTTPServer(ctrl *Controller, baseURL string) *http.Server {
 		writeJSON(w, map[string]any{
 			"running": ctrl.RunningCount(),
 			"total":   ctrl.TotalCount(),
+			"version": agent.Version,
 		})
 	})
 

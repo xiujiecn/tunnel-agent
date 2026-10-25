@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xiujiecn/tunnel-agent/agent"
 )
 
 const fullTokenForAPI = "secret-token-ABCDEFGH-12345678"
@@ -178,13 +180,51 @@ func TestAPISummary(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	var sum struct {
-		Running int `json:"running"`
-		Total   int `json:"total"`
+		Running int    `json:"running"`
+		Total   int    `json:"total"`
+		Version string `json:"version"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&sum); err != nil {
 		t.Fatal(err)
 	}
 	if sum.Running != 0 || sum.Total != 0 {
 		t.Fatalf("空态 summary=%+v", sum)
+	}
+	if sum.Version != agent.Version {
+		t.Fatalf("summary.version=%q，期望 %q", sum.Version, agent.Version)
+	}
+}
+
+// TestAPIStatusExposesVersion /api/status 必须带回 agent 真源版本字段。
+// 破坏性：从 writeJSON 里删掉 version ⇒ 本用例必须红。
+func TestAPIStatusExposesVersion(t *testing.T) {
+	ctrl := NewController()
+	srv := newHTTPServer(ctrl, "http://127.0.0.1:1")
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var st map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	ver, _ := st["version"].(string)
+	bt, _ := st["buildTime"].(string)
+	banner, _ := st["banner"].(string)
+	if ver != agent.Version {
+		t.Fatalf("version=%q，期望 %q", ver, agent.Version)
+	}
+	if bt != agent.BuildTime {
+		t.Fatalf("buildTime=%q，期望 %q", bt, agent.BuildTime)
+	}
+	if !strings.Contains(banner, agent.Version) {
+		t.Fatalf("banner 应含版本串，got %q", banner)
+	}
+	if banner != agent.BannerLine() {
+		t.Fatalf("banner=%q，期望 %q", banner, agent.BannerLine())
 	}
 }
